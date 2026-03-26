@@ -1,17 +1,18 @@
 # Simple Forwarder
 
-A high-performance SOCKS5 proxy forwarder written in Rust 2024 Edition.
+A high-performance Multi-Protocol Proxy Forwarder written in Rust 2024 Edition.
 
 ## Features
 
-- SOCKS5/SOCKS5h server for incoming connections
-- Forward traffic to SOCKS5/SOCKS5h/HTTP proxies based on rules
-- Domain wildcard matching using wildmatch crate
-- IP and CIDR matching (IPv4 and IPv6)
-- Asynchronous I/O using Tokio
-- System tray support with traffic indicator
-- Cross-platform support (Windows, macOS, Linux)
-- Configurable logging (console or file)
+- **Multi-Protocol Inbound**: Automatically detects and handles SOCKS5, SOCKS4, and HTTP proxy protocols on the same port.
+- **Rule-Based Forwarding**: Forward traffic to SOCKS5, SOCKS5h, or HTTP proxies based on flexible matching rules.
+- **Protocol Auto-Detection**: Zero-configuration switching between SOCKS5 (`0x05`), SOCKS4 (`0x04`), and HTTP (ASCII).
+- **Domain Wildcard Matching**: Using the `wildmatch` crate for flexible pattern matching.
+- **IP and CIDR Matching**: Supports both IPv4 and IPv6 address/range matching.
+- **Asynchronous I/O**: High performance using the Tokio runtime.
+- **System Tray support**: Visual traffic indicator (gray/green) and easy exit menu.
+- **Cross-platform**: Support for Windows, macOS, and Linux.
+- **Configurable logging**: Detailed console or file-based logs.
 
 ## Configuration
 
@@ -63,8 +64,9 @@ On Windows, the executable is built as a GUI application (no console window).
 
 ## Usage
 
-1. Run the executable
-2. Configure your applications to use SOCKS5 proxy at `127.0.0.1:1080`
+1. Run the executable.
+2. Configure your applications to use **SOCKS5**, **SOCKS4**, or **HTTP** proxy at `127.0.0.1:1080`.
+3. The forwarder automatically detects the protocol and applies your configured rules.
 3. The system tray icon shows:
    - Gray icon: No active traffic
    - Green icon: Active traffic forwarding
