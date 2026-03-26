@@ -41,12 +41,8 @@ impl Socks5Server {
                     let rules = self.rules.clone();
 
                     tokio::spawn(async move {
-                        let res = timeout(HANDSHAKE_TIMEOUT, handle_connection(stream, peer_addr, rules, tx)).await;
-                        match res {
-                            Ok(Ok(_)) => {},
-                            Ok(Err(e)) => log::error!("Error handling connection from {}: {}", peer_addr, e),
-                            Ok(Ok(_)) => {}, // This case is already handled above, but let's be safe
-                            Err(_) => log::warn!("Handshake with {} timed out", peer_addr),
+                        if let Err(e) = handle_connection(stream, peer_addr, rules, tx).await {
+                            log::error!("Error handling connection from {}: {}", peer_addr, e);
                         }
                     });
                 }
@@ -64,15 +60,28 @@ async fn handle_connection(
     rules: Vec<(RuleMatcher, ProxyConfig)>,
     tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut first_byte = [0u8; 1];
-    stream.read_exact(&mut first_byte).await?;
+    let res = timeout(HANDSHAKE_TIMEOUT, async {
+        let mut first_byte = [0u8; 1];
+        stream.read_exact(&mut first_byte).await?;
 
-    if first_byte[0] == 0x05 {
-        handle_socks5(first_byte[0], stream, peer_addr, rules, tx).await
-    } else if first_byte[0] == 0x04 {
-        handle_socks4(first_byte[0], stream, peer_addr, rules, tx).await
-    } else {
-        handle_http(first_byte[0], stream, peer_addr, rules, tx).await
+        if first_byte[0] == 0x05 {
+            handle_socks5(first_byte[0], stream, peer_addr, rules.clone()).await
+        } else if first_byte[0] == 0x04 {
+            handle_socks4(first_byte[0], stream, peer_addr, rules.clone()).await
+        } else {
+            handle_http(first_byte[0], stream, peer_addr, rules.clone()).await
+        }
+    }).await;
+
+    match res {
+        Ok(Ok((stream, target_stream, host, port))) => {
+            relay_data(stream, target_stream, host, port, peer_addr, tx).await
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            log::warn!("Handshake with {} timed out", peer_addr);
+            Err(anyhow::anyhow!("Handshake timed out"))
+        }
     }
 }
 
@@ -81,8 +90,7 @@ async fn handle_socks4(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: Vec<(RuleMatcher, ProxyConfig)>,
-    tx: mpsc::Sender<()>,
-) -> Result<()> {
+) -> Result<(TcpStream, TcpStream, String, u16)> {
     // SOCKS4 header: CMD (1), DSTPORT (2), DSTIP (4)
     let mut header = [0u8; 7];
     stream.read_exact(&mut header).await?;
@@ -129,7 +137,7 @@ async fn handle_socks4(
 
     send_socks4_reply(&mut stream, 0x5A).await?;
 
-    relay_data(stream, target_stream, host, port, peer_addr, tx).await
+    Ok((stream, target_stream, host, port))
 }
 
 async fn send_socks4_reply(stream: &mut TcpStream, status: u8) -> Result<()> {
@@ -145,8 +153,7 @@ async fn handle_socks5(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: Vec<(RuleMatcher, ProxyConfig)>,
-    tx: mpsc::Sender<()>,
-) -> Result<()> {
+) -> Result<(TcpStream, TcpStream, String, u16)> {
     // We already read the first byte (version 0x05)
     let mut second_byte = [0u8; 1];
     stream.read_exact(&mut second_byte).await?;
@@ -228,7 +235,7 @@ async fn handle_socks5(
 
     send_success_reply(&mut stream).await?;
 
-    relay_data(stream, target_stream, host, port, peer_addr, tx).await
+    Ok((stream, target_stream, host, port))
 }
 
 async fn handle_http(
@@ -236,8 +243,7 @@ async fn handle_http(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: Vec<(RuleMatcher, ProxyConfig)>,
-    tx: mpsc::Sender<()>,
-) -> Result<()> {
+) -> Result<(TcpStream, TcpStream, String, u16)> {
     let mut request_line = vec![first_byte];
     let mut byte = [0u8; 1];
     loop {
@@ -321,7 +327,7 @@ async fn handle_http(
         target_stream.write_all(&headers).await?;
     }
 
-    relay_data(stream, target_stream, host, port, peer_addr, tx).await
+    Ok((stream, target_stream, host, port))
 }
 
 async fn connect_to_target(
