@@ -21,6 +21,7 @@ Edit `config.yaml` to configure the proxy:
 ```yaml
 log:
   log_type: console  # or "file"
+  level: warn        # log level: debug, info, warn, error
   file: null         # required if log_type is "file"
 
 listen:

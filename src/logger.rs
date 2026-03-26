@@ -19,7 +19,7 @@ fn alloc_console() -> Result<()> {
 
 pub fn setup_logger(config: &LogConfig) -> Result<()> {
     let env = env_logger::Env::default()
-        .filter_or("RUST_LOG", "info");
+        .filter_or("RUST_LOG", &config.level);
 
     match config.log_type {
         crate::config::LogType::Console => {

@@ -1,5 +1,6 @@
 log:
   log_type: console
+  level: warn
   file: null
 
 listen:

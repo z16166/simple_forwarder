@@ -106,7 +106,7 @@ impl TrayManager {
                         }
                         continue;
                     }
-                    TranslateMessage(&msg);
+                    let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }

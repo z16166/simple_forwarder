@@ -15,6 +15,12 @@ pub struct LogConfig {
     #[serde(default = "default_log_type")]
     pub log_type: LogType,
     pub file: Option<String>,
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+fn default_log_level() -> String {
+    "warn".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
