@@ -140,12 +140,23 @@ impl TrayManager {
                             // Update Taskbar Icon (if console exists)
                             if !hwnd_console.0.is_null() {
                                 if let Ok(hicon) = Self::create_hicon_from_rgba(&icon_bytes, 32, 32) {
-                                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                                        hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize)
-                                    );
-                                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                                        hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize)
-                                    );
+                                    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM};
+
+                                    // Try both SendMessage and SetClassLongPtr for maximum compatibility
+                                    let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+                                    let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+                                    
+                                    #[cfg(target_pointer_width = "64")]
+                                    {
+                                        let _ = SetClassLongPtrW(hwnd_console, GCLP_HICON, hicon.0 as isize);
+                                        let _ = SetClassLongPtrW(hwnd_console, GCLP_HICONSM, hicon.0 as isize);
+                                    }
+                                    #[cfg(target_pointer_width = "32")]
+                                    {
+                                        use windows::Win32::UI::WindowsAndMessaging::{SetClassLongW, GCL_HICON, GCL_HICONSM};
+                                        let _ = SetClassLongW(hwnd_console, GCL_HICON, hicon.0 as i32);
+                                        let _ = SetClassLongW(hwnd_console, GCL_HICONSM, hicon.0 as i32);
+                                    }
                                     
                                     // Cleanup previous icon to prevent leaks
                                     if let Some(old_hicon) = last_hicon {
