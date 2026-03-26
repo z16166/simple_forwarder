@@ -67,10 +67,10 @@ On Windows, the executable is built as a GUI application (no console window).
 1. Run the executable.
 2. Configure your applications to use **SOCKS5**, **SOCKS4**, or **HTTP** proxy at `127.0.0.1:1080`.
 3. The forwarder automatically detects the protocol and applies your configured rules.
-3. The system tray icon shows:
+4. The system tray icon shows:
    - Gray icon: No active traffic
    - Green icon: Active traffic forwarding
-4. Right-click the tray icon and select "Quit" to exit
+5. Right-click the tray icon and select "Quit" to exit
 
 ## Development
 
