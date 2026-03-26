@@ -1,0 +1,28 @@
+log:
+  log_type: console
+  file: null
+
+listen:
+  addr: "127.0.0.1"
+  port: 1080
+
+rules:
+  - match_patterns:
+      - "*.google.com"
+      - "*.sina.com.cn"
+      - "*.youtube.com"
+      - "192.168.2.163"
+      - "192.168.1.0/24"
+      - "2001:db8::/32"
+    forward_to: "socks5://192.168.2.74:8080"
+
+  - match_patterns:
+      - "*.google.ae"
+      - "*.sina.cn"
+    forward_to: "socks5h://192.168.2.74:8081"
+
+  - match_patterns:
+      - "*.example.com"
+      - "192.168.166.0/8"
+      - "2001:0db8:85a3:0000:0000:8a2e:0370:7334/64"
+    forward_to: "http://192.168.2.74:8118"
