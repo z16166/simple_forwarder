@@ -1,7 +1,7 @@
 fn main() {
-    #[cfg(target_os = "windows")]
-    {
-        println!("cargo:rustc-link-arg=/ENTRY:mainCRTStartup");
-        println!("cargo:rustc-link-arg=/SUBSYSTEM:WINDOWS");
+    if std::env::var("CARGO_CFG_WINDOWS").is_ok() {
+        let mut res = winres::WindowsResource::new();
+        res.set_icon("resources/icon.ico");
+        res.compile().unwrap();
     }
 }
