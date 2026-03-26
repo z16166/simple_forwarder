@@ -108,18 +108,50 @@ impl TrayManager {
         {
             use windows::Win32::UI::WindowsAndMessaging::{
                 DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_USER,
+                WM_SETICON, ICON_SMALL, ICON_BIG, DestroyIcon, HICON,
             };
+            use windows::Win32::System::Console::GetConsoleWindow;
+            use windows::Win32::Foundation::{WPARAM, LPARAM};
+
             unsafe {
                 let mut msg = MSG::default();
                 log::debug!("Starting Win32 message loop");
+                let mut hwnd_console = GetConsoleWindow();
+                let mut last_hicon: Option<HICON> = None;
+
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     if msg.message == WM_USER + 1 {
                         let active = msg.wParam.0 != 0;
                         log::debug!("Received UI update message: active={}", active);
+
+                        // Lazy re-check for console window if not found initially
+                        if hwnd_console.0.is_null() {
+                            hwnd_console = GetConsoleWindow();
+                        }
+
                         if let Ok(icon_bytes) = Self::create_simple_icon(active) {
-                            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_bytes, 32, 32) {
+                            // Update Tray Icon
+                            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_bytes.clone(), 32, 32) {
                                 if let Err(e) = self._tray_icon.set_icon(Some(icon)) {
                                     log::error!("Failed to set tray icon: {}", e);
+                                }
+                            }
+
+                            // Update Taskbar Icon (if console exists)
+                            if !hwnd_console.0.is_null() {
+                                if let Ok(hicon) = Self::create_hicon_from_rgba(&icon_bytes, 32, 32) {
+                                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                                        hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize)
+                                    );
+                                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                                        hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize)
+                                    );
+                                    
+                                    // Cleanup previous icon to prevent leaks
+                                    if let Some(old_hicon) = last_hicon {
+                                        let _ = DestroyIcon(old_hicon);
+                                    }
+                                    last_hicon = Some(hicon);
                                 }
                             }
                         }
@@ -128,6 +160,11 @@ impl TrayManager {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                
+                // Final cleanup
+                if let Some(old_hicon) = last_hicon {
+                    let _ = DestroyIcon(old_hicon);
+                }
             }
         }
         #[cfg(not(windows))]
@@ -135,6 +172,44 @@ impl TrayManager {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_hicon_from_rgba(rgba: &[u8], width: i32, height: i32) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+        use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
+        use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+        unsafe {
+            // Convert RGBA to BGRA
+            let mut bgra = vec![0u8; rgba.len()];
+            for i in (0..rgba.len()).step_by(4) {
+                bgra[i] = rgba[i + 2];     // B
+                bgra[i + 1] = rgba[i + 1]; // G
+                bgra[i + 2] = rgba[i];     // R
+                bgra[i + 3] = rgba[i + 3]; // A
+            }
+
+            let h_bm_color = CreateBitmap(width, height, 1, 32, Some(bgra.as_ptr() as *const _));
+            
+            // Create a monochrome AND mask (all black = opaque)
+            let mask_bytes = vec![0u8; (width * height / 8) as usize];
+            let h_bm_mask = CreateBitmap(width, height, 1, 1, Some(mask_bytes.as_ptr() as *const _));
+
+            let icon_info = ICONINFO {
+                fIcon: true.into(),
+                xHotspot: 0,
+                yHotspot: 0,
+                hbmMask: h_bm_mask,
+                hbmColor: h_bm_color,
+            };
+
+            let hicon = CreateIconIndirect(&icon_info)?;
+
+            DeleteObject(h_bm_color);
+            DeleteObject(h_bm_mask);
+
+            Ok(hicon)
         }
     }
 
