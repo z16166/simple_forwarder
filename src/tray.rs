@@ -217,8 +217,8 @@ impl TrayManager {
 
             let hicon = CreateIconIndirect(&icon_info)?;
 
-            DeleteObject(h_bm_color);
-            DeleteObject(h_bm_mask);
+            let _ = DeleteObject(h_bm_color);
+            let _ = DeleteObject(h_bm_mask);
 
             Ok(hicon)
         }
