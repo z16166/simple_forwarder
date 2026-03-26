@@ -28,7 +28,7 @@ impl TrayManager {
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
             .with_tooltip("Simple Forwarder")
-            .with_icon(tray_icon::Icon::from_rgba(icon_bytes, 16, 16)?)
+            .with_icon(tray_icon::Icon::from_rgba(icon_bytes, 32, 32)?)
             .build()?;
 
         let menu_clone = menu.clone();
@@ -44,28 +44,42 @@ impl TrayManager {
             let mut rx = rx;
             let mut currently_active = false;
 
+            log::debug!("Activity detection task started");
+
             loop {
                 tokio::select! {
-                    _ = rx.recv() => {
+                    res = rx.recv() => {
+                        if res.is_none() {
+                            log::debug!("Activity channel closed");
+                            break;
+                        }
                         last_activity = std::time::Instant::now();
                         if !currently_active {
                             currently_active = true;
+                            log::debug!("Activity detected, switching icon to active");
                             is_active_clone.store(true, Ordering::Relaxed);
                             #[cfg(windows)]
                             unsafe {
                                 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                let _ = PostThreadMessageW(main_thread_id, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
+                                let success = PostThreadMessageW(main_thread_id, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
+                                if let Err(e) = success {
+                                    log::error!("Failed to post active message to main thread: {}", e);
+                                }
                             }
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         if currently_active && last_activity.elapsed() > Duration::from_secs(1) {
                             currently_active = false;
+                            log::debug!("Inactivity detected, switching icon to inactive");
                             is_active_clone.store(false, Ordering::Relaxed);
                             #[cfg(windows)]
                             unsafe {
                                 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                let _ = PostThreadMessageW(main_thread_id, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+                                let success = PostThreadMessageW(main_thread_id, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+                                if let Err(e) = success {
+                                    log::error!("Failed to post inactive message to main thread: {}", e);
+                                }
                             }
                         }
                     }
@@ -76,6 +90,7 @@ impl TrayManager {
         tokio::spawn(async move {
             while let Ok(event) = menu_channel.recv() {
                 if event.id == quit_id {
+                    log::info!("Quit menu selected");
                     std::process::exit(0);
                 }
             }
@@ -96,12 +111,16 @@ impl TrayManager {
             };
             unsafe {
                 let mut msg = MSG::default();
+                log::debug!("Starting Win32 message loop");
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     if msg.message == WM_USER + 1 {
                         let active = msg.wParam.0 != 0;
+                        log::debug!("Received UI update message: active={}", active);
                         if let Ok(icon_bytes) = Self::create_simple_icon(active) {
-                            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_bytes, 16, 16) {
-                                let _ = self._tray_icon.set_icon(Some(icon));
+                            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_bytes, 32, 32) {
+                                if let Err(e) = self._tray_icon.set_icon(Some(icon)) {
+                                    log::error!("Failed to set tray icon: {}", e);
+                                }
                             }
                         }
                         continue;
@@ -120,16 +139,16 @@ impl TrayManager {
     }
 
     fn create_simple_icon(active: bool) -> Result<Vec<u8>> {
-        let mut rgba = vec![0u8; 16 * 16 * 4];
+        let mut rgba = vec![0u8; 32 * 32 * 4];
         let color = if active {
             (0, 255, 0)
         } else {
             (100, 100, 100)
         };
 
-        for y in 0..16 {
-            for x in 0..16 {
-                let idx = (y * 16 + x) * 4;
+        for y in 0..32 {
+            for x in 0..32 {
+                let idx = (y * 32 + x) * 4;
                 if (x + y) % 2 == 0 {
                     rgba[idx] = color.0;
                     rgba[idx + 1] = color.1;

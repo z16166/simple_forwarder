@@ -21,12 +21,26 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
     let env = env_logger::Env::default()
         .filter_or("RUST_LOG", &config.level);
 
+    let builder = env_logger::Builder::from_env(env);
+    let mut builder = builder;
+    
+    builder.format(|buf, record| {
+        use std::io::Write;
+        let now = chrono::Local::now();
+        writeln!(
+            buf,
+            "[{} {:5} {}] {}",
+            now.format("%Y-%m-%dT%H:%M:%S"),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+
     match config.log_type {
         crate::config::LogType::Console => {
             alloc_console()?;
-            env_logger::Builder::from_env(env)
-                .format_timestamp_secs()
-                .init();
+            builder.init();
         }
         crate::config::LogType::File => {
             let log_file = config.file.as_ref()
@@ -38,10 +52,7 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
                 .open(log_file)
                 .with_context(|| format!("Failed to open log file: {}", log_file))?;
 
-            env_logger::Builder::from_env(env)
-                .format_timestamp_secs()
-                .target(env_logger::Target::Pipe(Box::new(file)))
-                .init();
+            builder.target(env_logger::Target::Pipe(Box::new(file))).init();
         }
     }
 
