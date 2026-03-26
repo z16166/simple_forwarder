@@ -60,7 +60,9 @@ cargo build --release
 
 ## Windows GUI Mode
 
-On Windows, the executable is built as a GUI application (no console window).
+On Windows, the application runs as a GUI process by default.
+- If `log_type` is set to `console` in `config.yaml`, a console window will be automatically allocated to show logs.
+- If `log_type` is set to `file` or other values, the application runs silently in the background (accessible via the system tray).
 
 ## Usage
 
