@@ -4,14 +4,14 @@ mod config;
 mod logger;
 mod matcher;
 mod proxy_client;
-mod socks5_server;
+mod proxy_server;
 mod tray;
 
 use anyhow::{Context, Result};
 use config::Config;
 use matcher::RuleMatcher;
 use proxy_client::ProxyConfig;
-use socks5_server::Socks5Server;
+use proxy_server::ProxyServer;
 use std::path::Path;
 use tokio::sync::mpsc;
 
@@ -38,13 +38,13 @@ async fn main() -> Result<()> {
     let listen_addr = config.get_listen_addr()?;
 
     let tray_manager = tray::TrayManager::new(rx)?;
-    let mut server = Socks5Server::new(listen_addr, tx, rules).await?;
+    let mut server = ProxyServer::new(listen_addr, tx, rules).await?;
 
     log::info!("Simple Forwarder is running...");
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
-            log::error!("SOCKS5 server error: {}", e);
+            log::error!("Proxy server error: {}", e);
         }
     });
 

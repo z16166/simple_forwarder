@@ -13,21 +13,27 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 use crate::matcher::RuleMatcher;
 use crate::proxy_client::{ProxyClient, ProxyConfig};
 
-pub struct Socks5Server {
+pub struct ProxyServer {
     listener: TcpListener,
     tx: mpsc::Sender<()>,
     rules: Vec<(RuleMatcher, ProxyConfig)>,
 }
 
-impl Socks5Server {
-    pub async fn new(addr: SocketAddr, tx: mpsc::Sender<()>, rules: Vec<(RuleMatcher, ProxyConfig)>) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
+impl ProxyServer {
+    pub async fn new(
+        listen_addr: SocketAddr,
+        tx: mpsc::Sender<()>,
+        rules: Vec<(RuleMatcher, ProxyConfig)>,
+    ) -> Result<Self> {
+        let listener = TcpListener::bind(listen_addr)
             .await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
-
-        log::info!("SOCKS5 server listening on {}", addr);
-
-        Ok(Self { listener, tx, rules })
+            .with_context(|| format!("Failed to bind to {}", listen_addr))?;
+        log::info!("Proxy server listening on {}", listen_addr);
+        Ok(Self {
+            listener,
+            tx,
+            rules,
+        })
     }
 
     pub async fn run(&mut self) -> Result<()> {
