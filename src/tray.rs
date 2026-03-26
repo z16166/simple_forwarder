@@ -18,7 +18,7 @@ impl TrayManager {
     pub fn new(rx: mpsc::Receiver<()>) -> Result<Self> {
         let is_active = Arc::new(AtomicBool::new(false));
 
-        let quit_item = MenuItem::new("退出", true, None);
+        let quit_item = MenuItem::new("Quit", true, None);
         let quit_id = quit_item.id().clone();
         let menu = Menu::new();
         menu.append(&quit_item)?;

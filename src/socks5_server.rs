@@ -55,15 +55,94 @@ async fn handle_connection(
     rules: Vec<(RuleMatcher, ProxyConfig)>,
     tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut header = [0u8; 2];
+    let mut first_byte = [0u8; 1];
+    stream.read_exact(&mut first_byte).await?;
+
+    if first_byte[0] == 0x05 {
+        handle_socks5(first_byte[0], stream, peer_addr, rules, tx).await
+    } else if first_byte[0] == 0x04 {
+        handle_socks4(first_byte[0], stream, peer_addr, rules, tx).await
+    } else {
+        handle_http(first_byte[0], stream, peer_addr, rules, tx).await
+    }
+}
+
+async fn handle_socks4(
+    _first_byte: u8,
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    tx: mpsc::Sender<()>,
+) -> Result<()> {
+    // SOCKS4 header: CMD (1), DSTPORT (2), DSTIP (4)
+    let mut header = [0u8; 7];
     stream.read_exact(&mut header).await?;
 
-    let version = header[0];
-    if version != 0x05 {
-        return Err(anyhow::anyhow!("Unsupported SOCKS version: {}", version));
+    let cmd = header[0];
+    if cmd != 0x01 {
+        send_socks4_reply(&mut stream, 0x5B).await?;
+        return Err(anyhow::anyhow!("Unsupported SOCKS4 command: {}", cmd));
     }
 
-    let nmethods = header[1] as usize;
+    let port = u16::from_be_bytes([header[1], header[2]]);
+    let ip_bytes = [header[3], header[4], header[5], header[6]];
+    let is_socks4a = ip_bytes[0] == 0 && ip_bytes[1] == 0 && ip_bytes[2] == 0 && ip_bytes[3] != 0;
+
+    // Read User ID (null-terminated)
+    let mut user_id = vec![];
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await?;
+        if byte[0] == 0 { break; }
+        user_id.push(byte[0]);
+        if user_id.len() > 255 { return Err(anyhow::anyhow!("SOCKS4 User ID too long")); }
+    }
+
+    let host = if is_socks4a {
+        // Read Domain Name (null-terminated)
+        let mut domain = vec![];
+        loop {
+            stream.read_exact(&mut byte).await?;
+            if byte[0] == 0 { break; }
+            domain.push(byte[0]);
+            if domain.len() > 255 { return Err(anyhow::anyhow!("SOCKS4a domain too long")); }
+        }
+        String::from_utf8_lossy(&domain).to_string()
+    } else {
+        Ipv4Addr::from(ip_bytes).to_string()
+    };
+
+    let ip = if is_socks4a { None } else { Some(IpAddr::V4(Ipv4Addr::from(ip_bytes))) };
+
+    log::info!("SOCKS4{} request from {}: {}:{}", if is_socks4a { "a" } else { "" }, peer_addr, host, port);
+
+    let target_stream = connect_to_target(&host, port, is_socks4a, ip, &rules, &mut stream, false).await?;
+
+    send_socks4_reply(&mut stream, 0x5A).await?;
+
+    relay_data(stream, target_stream, host, port, peer_addr, tx).await
+}
+
+async fn send_socks4_reply(stream: &mut TcpStream, status: u8) -> Result<()> {
+    let mut reply = [0u8; 8];
+    reply[1] = status;
+    // bytes 2-7 are ignored by SOCKS4 clients for CONNECT
+    stream.write_all(&reply).await?;
+    Ok(())
+}
+
+async fn handle_socks5(
+    _first_byte: u8,
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    tx: mpsc::Sender<()>,
+) -> Result<()> {
+    // We already read the first byte (version 0x05)
+    let mut second_byte = [0u8; 1];
+    stream.read_exact(&mut second_byte).await?;
+    let nmethods = second_byte[0] as usize;
+
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
@@ -134,96 +213,182 @@ async fn handle_connection(
         }
     };
 
-    log::info!("Request from {}: {}:{} (atyp={}, resolve_hostname: {})", peer_addr, host, port, atyp, resolve_hostname);
+    log::info!("SOCKS5 request from {}: {}:{}", peer_addr, host, port);
 
-    let mut target_stream = None;
+    let target_stream = connect_to_target(&host, port, resolve_hostname, ip, &rules, &mut stream, true).await?;
 
-    for (matcher, proxy_config) in &rules {
-        log::debug!("Checking rule with host={}, ip={:?}", host, ip);
-        if matcher.matches(&host, ip) {
-            log::info!("Matched rule, forwarding to proxy: {}", proxy_config.addr);
+    send_success_reply(&mut stream).await?;
+
+    relay_data(stream, target_stream, host, port, peer_addr, tx).await
+}
+
+async fn handle_http(
+    first_byte: u8,
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    tx: mpsc::Sender<()>,
+) -> Result<()> {
+    let mut request_line = vec![first_byte];
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await?;
+        request_line.push(byte[0]);
+        if request_line.ends_with(b"\n") {
+            break;
+        }
+        if request_line.len() > 4096 {
+            return Err(anyhow::anyhow!("HTTP request line too long"));
+        }
+    }
+
+    let request_line_str = String::from_utf8_lossy(&request_line).trim().to_string();
+    log::debug!("HTTP request line: {}", request_line_str);
+
+    let parts: Vec<&str> = request_line_str.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(anyhow::anyhow!("Invalid HTTP request line: {}", request_line_str));
+    }
+
+    let method = parts[0];
+    let uri = parts[1];
+
+    let (host, port, is_connect) = if method.to_uppercase() == "CONNECT" {
+        let host_port: Vec<&str> = uri.split(':').collect();
+        let host = host_port[0].to_string();
+        let port = if host_port.len() > 1 {
+            host_port[1].parse().unwrap_or(443)
+        } else {
+            443
+        };
+        (host, port, true)
+    } else {
+        let uri_parsed = uri.parse::<http::Uri>().map_err(|_| anyhow::anyhow!("Failed to parse URI: {}", uri))?;
+        let host = uri_parsed.host().ok_or_else(|| anyhow::anyhow!("Missing host in HTTP URI"))?.to_string();
+        let port = uri_parsed.port_u16().unwrap_or(80);
+        (host, port, false)
+    };
+
+    log::info!("HTTP {} request from {}: {}:{}", method, peer_addr, host, port);
+
+    let mut target_stream = connect_to_target(&host, port, true, None, &rules, &mut stream, false).await?;
+
+    if is_connect {
+        // CONNECT request: read headers until empty line (discard them)
+        let mut line = vec![];
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await?;
+            line.push(byte[0]);
+            if line.ends_with(b"\r\n\r\n") || line.ends_with(b"\n\n") {
+                break;
+            }
+            if line.len() > 8192 {
+                return Err(anyhow::anyhow!("HTTP CONNECT headers too long"));
+            }
+        }
+        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+    } else {
+        // Regular GET/POST request: forward the original request line and headers
+        
+        // Forward the modified request line if connecting directly,
+        // or the original if connecting to an upstream proxy.
+        // For simplicity, we'll try to forward the headers and original request line first.
+        target_stream.write_all(&request_line).await?;
+
+        // Relay headers until \r\n\r\n
+        let mut header_buf = [0u8; 1];
+        let mut headers = vec![];
+        loop {
+            stream.read_exact(&mut header_buf).await?;
+            headers.push(header_buf[0]);
+            if headers.ends_with(b"\r\n\r\n") || headers.ends_with(b"\n\n") {
+                break;
+            }
+            if headers.len() > 16384 {
+                return Err(anyhow::anyhow!("HTTP headers too long"));
+            }
+        }
+        target_stream.write_all(&headers).await?;
+    }
+
+    relay_data(stream, target_stream, host, port, peer_addr, tx).await
+}
+
+async fn connect_to_target(
+    host: &str,
+    port: u16,
+    resolve_hostname: bool,
+    ip: Option<IpAddr>,
+    rules: &[(RuleMatcher, ProxyConfig)],
+    client_stream: &mut TcpStream,
+    is_socks: bool,
+) -> Result<TcpStream> {
+    for (matcher, proxy_config) in rules {
+        if matcher.matches(host, ip) {
+            log::info!("Matched rule, forwarding {} to proxy: {}", host, proxy_config.addr);
             let client = ProxyClient::new(proxy_config.clone());
-            log::debug!("About to connect to proxy...");
-            match client.connect(&host, port, resolve_hostname).await {
-                Ok(s) => {
-                    log::debug!("Successfully connected to proxy");
-                    target_stream = Some(s);
-                    break;
-                }
+            match client.connect(host, port, resolve_hostname).await {
+                Ok(s) => return Ok(s),
                 Err(e) => {
                     log::error!("Failed to connect to proxy {}: {}", proxy_config.addr, e);
-                    send_error_reply(&mut stream, 0x05).await?;
+                    if is_socks {
+                        let _ = send_error_reply(client_stream, 0x05).await;
+                    }
                     return Err(e);
                 }
             }
         }
     }
 
-    if target_stream.is_none() {
-        log::info!("No rule matched, connecting directly to {}:{}", host, port);
-        match TcpStream::connect((host.as_str(), port)).await {
-            Ok(s) => {
-                target_stream = Some(s);
+    log::info!("No rule matched, connecting directly to {}:{}", host, port);
+    match TcpStream::connect((host, port)).await {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            log::error!("Failed to connect directly to {}:{}: {}", host, port, e);
+            if is_socks {
+                let _ = send_error_reply(client_stream, 0x05).await;
             }
-            Err(e) => {
-                log::error!("Failed to connect directly to {}:{}: {}", host, port, e);
-                send_error_reply(&mut stream, 0x05).await?;
-                return Err(e.into());
-            }
+            Err(e.into())
         }
     }
+}
 
-    let target_stream = target_stream.unwrap();
-
-    log::debug!("Successfully connected to target {}:{}", host, port);
-
-    send_success_reply(&mut stream).await?;
-
-    log::debug!("Sent SOCKS5 success reply to client");
-
+async fn relay_data(
+    stream: TcpStream,
+    target_stream: TcpStream,
+    host: String,
+    port: u16,
+    peer_addr: SocketAddr,
+    tx: mpsc::Sender<()>,
+) -> Result<()> {
     let _ = tx.send(()).await;
 
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
     let client_to_target = async {
-        log::debug!("Starting client to target data transfer");
         let result = tokio::io::copy(&mut client_reader, &mut target_writer).await;
-        if let Ok(bytes) = &result {
-            log::info!("Client to target data transfer completed: {} bytes", bytes);
-        }
         let _ = target_writer.shutdown().await;
-        log::debug!("Target writer shutdown complete");
         result
     };
 
     let target_to_client = async {
-        log::debug!("Starting target to client data transfer");
         let result = tokio::io::copy(&mut target_reader, &mut client_writer).await;
-        if let Ok(bytes) = &result {
-            log::info!("Target to client data transfer completed: {} bytes", bytes);
-        }
         let _ = client_writer.shutdown().await;
-        log::debug!("Client writer shutdown complete");
         result
     };
 
-    log::debug!("Waiting for data transfer to complete...");
+    let (c2t, t2c) = tokio::join!(client_to_target, target_to_client);
 
-    let (client_to_target_result, target_to_client_result) = tokio::join!(
-        client_to_target,
-        target_to_client
-    );
-
-    if let Err(e) = client_to_target_result {
+    if let Err(e) = c2t {
         log::debug!("Client to target copy error: {}", e);
     }
-    if let Err(e) = target_to_client_result {
+    if let Err(e) = t2c {
         log::debug!("Target to client copy error: {}", e);
     }
 
     log::info!("Connection from {} to {}:{} closed", peer_addr, host, port);
-
     Ok(())
 }
 
