@@ -51,8 +51,9 @@ pub struct Rule {
 }
 
 impl Config {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref())
+    pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let content = tokio::fs::read_to_string(path.as_ref())
+            .await
             .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
 
         let config: Config = serde_yaml::from_str(&content)

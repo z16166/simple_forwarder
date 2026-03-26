@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = Path::new("config.yaml");
-    let config = Config::from_file(config_path)
+    let config = Config::from_file(config_path).await
         .with_context(|| "Failed to load config")?;
 
     logger::setup_logger(&config.log)?;
@@ -35,13 +35,18 @@ async fn main() -> Result<()> {
 
     let listen_addr = config.get_listen_addr()?;
 
-    let _tray = tray::TrayManager::new(rx)?;
-
+    let tray_manager = tray::TrayManager::new(rx)?;
     let mut server = Socks5Server::new(listen_addr, tx, rules).await?;
 
     log::info!("Simple Forwarder is running...");
 
-    server.run().await?;
+    tokio::spawn(async move {
+        if let Err(e) = server.run().await {
+            log::error!("SOCKS5 server error: {}", e);
+        }
+    });
+
+    tray_manager.run_message_loop();
 
     Ok(())
 }

@@ -9,7 +9,7 @@ pub struct RuleMatcher {
 
 #[derive(Clone)]
 enum Pattern {
-    Domain(String),
+    Domain(WildMatch),
     Ip(IpAddr),
     Cidr(IpNet),
 }
@@ -29,7 +29,7 @@ impl RuleMatcher {
         } else if pattern.parse::<IpAddr>().is_ok() {
             pattern.parse::<IpAddr>().ok().map(Pattern::Ip)
         } else {
-            Some(Pattern::Domain(pattern))
+            Some(Pattern::Domain(WildMatch::new(&pattern)))
         }
     }
 
@@ -44,8 +44,7 @@ impl RuleMatcher {
 
     fn match_pattern(&self, pattern: &Pattern, host: &str, ip: Option<IpAddr>) -> bool {
         match pattern {
-            Pattern::Domain(domain) => {
-                let matcher = WildMatch::new(domain);
+            Pattern::Domain(matcher) => {
                 matcher.matches(host)
             }
             Pattern::Ip(pattern_ip) => {

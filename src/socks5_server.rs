@@ -55,21 +55,17 @@ async fn handle_connection(
     rules: Vec<(RuleMatcher, ProxyConfig)>,
     tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut buffer = BytesMut::with_capacity(262);
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await?;
 
-    stream.read_buf(&mut buffer).await?;
-
-    if buffer.is_empty() {
-        return Ok(());
-    }
-
-    let version = buffer[0];
+    let version = header[0];
     if version != 0x05 {
         return Err(anyhow::anyhow!("Unsupported SOCKS version: {}", version));
     }
 
-    let nmethods = buffer[1] as usize;
-    let methods = &buffer[2..2 + nmethods];
+    let nmethods = header[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    stream.read_exact(&mut methods).await?;
 
     let selected_method = if methods.contains(&0x00) {
         0x00
@@ -77,9 +73,9 @@ async fn handle_connection(
         0xFF
     };
 
-    let mut response = BytesMut::with_capacity(2);
-    response.put_u8(0x05);
-    response.put_u8(selected_method);
+    let mut response = [0u8; 2];
+    response[0] = 0x05;
+    response[1] = selected_method;
 
     stream.write_all(&response).await?;
 
@@ -87,48 +83,49 @@ async fn handle_connection(
         return Err(anyhow::anyhow!("No acceptable authentication method"));
     }
 
-    buffer.clear();
-    stream.read_buf(&mut buffer).await?;
+    let mut request_header = [0u8; 4];
+    stream.read_exact(&mut request_header).await?;
 
-    if buffer.len() < 4 {
-        return Err(anyhow::anyhow!("Invalid SOCKS5 request"));
+    if request_header[0] != 0x05 {
+        return Err(anyhow::anyhow!("Invalid SOCKS5 version in request"));
     }
 
-    let cmd = buffer[1];
+    let cmd = request_header[1];
     if cmd != 0x01 {
         send_error_reply(&mut stream, 0x07).await?;
         return Err(anyhow::anyhow!("Unsupported command: {}", cmd));
     }
 
-    let atyp = buffer[3];
+    let atyp = request_header[3];
     let (host, port, resolve_hostname, ip) = match atyp {
         0x01 => {
-            let addr = Ipv4Addr::new(buffer[4], buffer[5], buffer[6], buffer[7]);
-            let port = u16::from_be_bytes([buffer[8], buffer[9]]);
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr).await?;
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let addr = Ipv4Addr::from(addr);
+            let port = u16::from_be_bytes(port_buf);
             (addr.to_string(), port, false, Some(IpAddr::V4(addr)))
         }
         0x03 => {
-            let len = buffer[4] as usize;
-            if buffer.len() < 5 + len + 2 {
-                send_error_reply(&mut stream, 0x01).await?;
-                return Err(anyhow::anyhow!("Invalid domain length"));
-            }
-            let host = String::from_utf8_lossy(&buffer[5..5 + len]).to_string();
-            let port = u16::from_be_bytes([buffer[5 + len], buffer[5 + len + 1]]);
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+            let mut host_buf = vec![0u8; len];
+            stream.read_exact(&mut host_buf).await?;
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let host = String::from_utf8_lossy(&host_buf).to_string();
+            let port = u16::from_be_bytes(port_buf);
             (host, port, true, None)
         }
         0x04 => {
-            let addr = Ipv6Addr::new(
-                u16::from_be_bytes([buffer[4], buffer[5]]),
-                u16::from_be_bytes([buffer[6], buffer[7]]),
-                u16::from_be_bytes([buffer[8], buffer[9]]),
-                u16::from_be_bytes([buffer[10], buffer[11]]),
-                u16::from_be_bytes([buffer[12], buffer[13]]),
-                u16::from_be_bytes([buffer[14], buffer[15]]),
-                u16::from_be_bytes([buffer[16], buffer[17]]),
-                u16::from_be_bytes([buffer[18], buffer[19]]),
-            );
-            let port = u16::from_be_bytes([buffer[20], buffer[21]]);
+            let mut addr = [0u8; 16];
+            stream.read_exact(&mut addr).await?;
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let addr = Ipv6Addr::from(addr);
+            let port = u16::from_be_bytes(port_buf);
             (addr.to_string(), port, false, Some(IpAddr::V6(addr)))
         }
         _ => {
@@ -137,16 +134,19 @@ async fn handle_connection(
         }
     };
 
-    log::info!("Request from {}: {}:{} (resolve_hostname: {})", peer_addr, host, port, resolve_hostname);
+    log::info!("Request from {}: {}:{} (atyp={}, resolve_hostname: {})", peer_addr, host, port, atyp, resolve_hostname);
 
     let mut target_stream = None;
 
     for (matcher, proxy_config) in &rules {
+        log::debug!("Checking rule with host={}, ip={:?}", host, ip);
         if matcher.matches(&host, ip) {
             log::info!("Matched rule, forwarding to proxy: {}", proxy_config.addr);
             let client = ProxyClient::new(proxy_config.clone());
+            log::debug!("About to connect to proxy...");
             match client.connect(&host, port, resolve_hostname).await {
                 Ok(s) => {
+                    log::debug!("Successfully connected to proxy");
                     target_stream = Some(s);
                     break;
                 }
@@ -173,37 +173,56 @@ async fn handle_connection(
         }
     }
 
-    let mut target_stream = target_stream.unwrap();
+    let target_stream = target_stream.unwrap();
+
+    log::debug!("Successfully connected to target {}:{}", host, port);
 
     send_success_reply(&mut stream).await?;
 
+    log::debug!("Sent SOCKS5 success reply to client");
+
     let _ = tx.send(()).await;
 
-    let (mut client_reader, mut client_writer) = stream.split();
-    let (mut target_reader, mut target_writer) = target_stream.split();
+    let (mut client_reader, mut client_writer) = stream.into_split();
+    let (mut target_reader, mut target_writer) = target_stream.into_split();
 
     let client_to_target = async {
-        tokio::io::copy(&mut client_reader, &mut target_writer).await
+        log::debug!("Starting client to target data transfer");
+        let result = tokio::io::copy(&mut client_reader, &mut target_writer).await;
+        if let Ok(bytes) = &result {
+            log::info!("Client to target data transfer completed: {} bytes", bytes);
+        }
+        let _ = target_writer.shutdown().await;
+        log::debug!("Target writer shutdown complete");
+        result
     };
 
     let target_to_client = async {
-        tokio::io::copy(&mut target_reader, &mut client_writer).await
+        log::debug!("Starting target to client data transfer");
+        let result = tokio::io::copy(&mut target_reader, &mut client_writer).await;
+        if let Ok(bytes) = &result {
+            log::info!("Target to client data transfer completed: {} bytes", bytes);
+        }
+        let _ = client_writer.shutdown().await;
+        log::debug!("Client writer shutdown complete");
+        result
     };
 
-    tokio::select! {
-        result = client_to_target => {
-            if let Err(e) = result {
-                log::debug!("Client to target copy error: {}", e);
-            }
-        }
-        result = target_to_client => {
-            if let Err(e) = result {
-                log::debug!("Target to client copy error: {}", e);
-            }
-        }
+    log::debug!("Waiting for data transfer to complete...");
+
+    let (client_to_target_result, target_to_client_result) = tokio::join!(
+        client_to_target,
+        target_to_client
+    );
+
+    if let Err(e) = client_to_target_result {
+        log::debug!("Client to target copy error: {}", e);
+    }
+    if let Err(e) = target_to_client_result {
+        log::debug!("Target to client copy error: {}", e);
     }
 
-    log::debug!("Connection from {} to {}:{} closed", peer_addr, host, port);
+    log::info!("Connection from {} to {}:{} closed", peer_addr, host, port);
 
     Ok(())
 }

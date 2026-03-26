@@ -3,12 +3,27 @@ use std::fs::OpenOptions;
 
 use crate::config::LogConfig;
 
+#[cfg(windows)]
+fn alloc_console() -> Result<()> {
+    use windows::Win32::System::Console::AllocConsole;
+    unsafe {
+        AllocConsole()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn alloc_console() -> Result<()> {
+    Ok(())
+}
+
 pub fn setup_logger(config: &LogConfig) -> Result<()> {
     let env = env_logger::Env::default()
         .filter_or("RUST_LOG", "info");
 
     match config.log_type {
         crate::config::LogType::Console => {
+            alloc_console()?;
             env_logger::Builder::from_env(env)
                 .format_timestamp_secs()
                 .init();
