@@ -3,7 +3,12 @@ use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::matcher::RuleMatcher;
 use crate::proxy_client::{ProxyClient, ProxyConfig};
@@ -36,8 +41,12 @@ impl Socks5Server {
                     let rules = self.rules.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, peer_addr, rules, tx).await {
-                            log::error!("Error handling connection from {}: {}", peer_addr, e);
+                        let res = timeout(HANDSHAKE_TIMEOUT, handle_connection(stream, peer_addr, rules, tx)).await;
+                        match res {
+                            Ok(Ok(_)) => {},
+                            Ok(Err(e)) => log::error!("Error handling connection from {}: {}", peer_addr, e),
+                            Ok(Ok(_)) => {}, // This case is already handled above, but let's be safe
+                            Err(_) => log::warn!("Handshake with {} timed out", peer_addr),
                         }
                     });
                 }
@@ -342,14 +351,21 @@ async fn connect_to_target(
     }
 
     log::info!("No rule matched, connecting directly to {}:{}", host, port);
-    match TcpStream::connect((host, port)).await {
-        Ok(s) => Ok(s),
-        Err(e) => {
+    match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => {
             log::error!("Failed to connect directly to {}:{}: {}", host, port, e);
             if is_socks {
                 let _ = send_error_reply(client_stream, 0x05).await;
             }
             Err(e.into())
+        }
+        Err(_) => {
+            log::error!("Connection to {}:{} timed out", host, port);
+            if is_socks {
+                let _ = send_error_reply(client_stream, 0x05).await;
+            }
+            Err(anyhow::anyhow!("Connection timed out"))
         }
     }
 }
@@ -368,24 +384,46 @@ async fn relay_data(
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
     let client_to_target = async {
-        let result = tokio::io::copy(&mut client_reader, &mut target_writer).await;
-        let _ = target_writer.shutdown().await;
-        result
+        let mut buf = [0u8; 8192];
+        loop {
+            let read_future = client_reader.read(&mut buf);
+            match timeout(IDLE_TIMEOUT, read_future).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    target_writer.write_all(&buf[..n]).await?;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
+            }
+        }
+        target_writer.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
     };
 
     let target_to_client = async {
-        let result = tokio::io::copy(&mut target_reader, &mut client_writer).await;
-        let _ = client_writer.shutdown().await;
-        result
+        let mut buf = [0u8; 8192];
+        loop {
+            let read_future = target_reader.read(&mut buf);
+            match timeout(IDLE_TIMEOUT, read_future).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    client_writer.write_all(&buf[..n]).await?;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
+            }
+        }
+        client_writer.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
     };
 
     let (c2t, t2c) = tokio::join!(client_to_target, target_to_client);
 
     if let Err(e) = c2t {
-        log::debug!("Client to target copy error: {}", e);
+        log::debug!("Client to target relay finished: {}", e);
     }
     if let Err(e) = t2c {
-        log::debug!("Target to client copy error: {}", e);
+        log::debug!("Target to client relay finished: {}", e);
     }
 
     log::info!("Connection from {} to {}:{} closed", peer_addr, host, port);
