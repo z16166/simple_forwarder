@@ -16,10 +16,23 @@ enum Pattern {
 
 impl RuleMatcher {
     pub fn new(patterns: Vec<String>) -> Self {
-        let parsed_patterns = patterns.into_iter()
-            .filter_map(|p| Self::parse_pattern(p))
-            .collect();
-
+        let mut parsed_patterns = Vec::new();
+        for p in patterns {
+            // Expansion: if it starts with "*.", match both "*.domain.com" and "domain.com"
+            if p.starts_with("*.") && p.len() > 2 {
+                if let Some(pat) = Self::parse_pattern(p.clone()) {
+                    parsed_patterns.push(pat);
+                }
+                let root_domain = &p[2..];
+                if let Some(pat) = Self::parse_pattern(root_domain.to_string()) {
+                    parsed_patterns.push(pat);
+                }
+            } else {
+                if let Some(pat) = Self::parse_pattern(p) {
+                    parsed_patterns.push(pat);
+                }
+            }
+        }
         Self { patterns: parsed_patterns }
     }
 
@@ -77,7 +90,7 @@ mod tests {
 
         assert!(matcher.matches("www.google.com", None));
         assert!(matcher.matches("mail.google.com", None));
-        assert!(!matcher.matches("google.com", None));
+        assert!(matcher.matches("google.com", None)); // Now matches the root domain too!
         assert!(!matcher.matches("example.com", None));
     }
 
