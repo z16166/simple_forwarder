@@ -7,12 +7,13 @@ A high-performance Multi-Protocol Proxy Forwarder written in Rust 2024 Edition.
 - **Multi-Protocol Inbound**: Automatically detects and handles SOCKS5, SOCKS4, and HTTP proxy protocols on the same port.
 - **Rule-Based Forwarding**: Forward traffic to SOCKS5, SOCKS5h, or HTTP proxies based on flexible matching rules.
 - **Protocol Auto-Detection**: Zero-configuration switching between SOCKS5 (`0x05`), SOCKS4 (`0x04`), and HTTP (ASCII).
-- **Domain Wildcard Matching**: Using the `wildmatch` crate for flexible pattern matching.
+- **Domain Wildcard Matching**: Support for `*.domain.com` which matches both subdomains and the root domain.
+- **Hot-Reloading**: Automatically detects changes to `config.yaml` and reloads routing rules without service interruption using RCU-style updates (`arc-swap`).
 - **IP and CIDR Matching**: Supports both IPv4 and IPv6 address/range matching.
 - **Asynchronous I/O**: High performance using the Tokio runtime.
 - **System Tray support**: Visual traffic indicator (gray/green) and easy exit menu.
 - **Cross-platform**: Support for Windows, macOS, and Linux.
-- **Configurable logging**: Detailed console or file-based logs.
+- **Configurable logging**: Detailed console or file-based logs with local-time support.
 
 ## Configuration
 
@@ -39,9 +40,9 @@ rules:
 
 The proxy supports three types of pattern matching:
 
-1. **Domain Wildcard**: `*.google.com` matches any subdomain of google.com
-2. **Single IP**: `192.168.1.1` matches exactly this IP address
-3. **CIDR**: `192.168.1.0/24` matches any IP in this range (supports both IPv4 and IPv6)
+1. **Domain Wildcard**: `*.google.com` matches any subdomain (e.g. `www.google.com`) and also the root domain (`google.com`).
+2. **Single IP**: `192.168.1.1` matches exactly this IP address.
+3. **CIDR**: `192.168.1.0/24` matches any IP in this range (supports both IPv4 and IPv6).
 
 Rules are evaluated in order. The first matching rule is used to forward the traffic. If no rule matches, the connection is made directly.
 
