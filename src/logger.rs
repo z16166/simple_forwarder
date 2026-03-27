@@ -27,11 +27,16 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
     builder.format(|buf, record| {
         use std::io::Write;
         let now = chrono::Local::now();
+        let level = record.level();
+        let style = buf.default_level_style(level);
+        
         writeln!(
             buf,
-            "[{} {:5} {}] {}",
+            "[{} {}{:5}{} {}] {}",
             now.format("%Y-%m-%dT%H:%M:%S"),
-            record.level(),
+            style.render(),
+            level,
+            style.render_reset(),
             record.target(),
             record.args()
         )
