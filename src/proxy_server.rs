@@ -12,18 +12,20 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::matcher::RuleMatcher;
 use crate::proxy_client::{ProxyClient, ProxyConfig};
+use arc_swap::ArcSwap;
+use std::sync::Arc;
 
 pub struct ProxyServer {
     listener: TcpListener,
     tx: mpsc::Sender<()>,
-    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
 }
 
 impl ProxyServer {
     pub async fn new(
         listen_addr: SocketAddr,
         tx: mpsc::Sender<()>,
-        rules: Vec<(RuleMatcher, ProxyConfig)>,
+        rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(listen_addr)
             .await
@@ -63,19 +65,20 @@ impl ProxyServer {
 async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
     tx: mpsc::Sender<()>,
 ) -> Result<()> {
+    let rules_guard = rules.load();
     let res = timeout(HANDSHAKE_TIMEOUT, async {
         let mut first_byte = [0u8; 1];
         stream.read_exact(&mut first_byte).await?;
 
         if first_byte[0] == 0x05 {
-            handle_socks5(first_byte[0], stream, peer_addr, rules.clone()).await
+            handle_socks5(first_byte[0], stream, peer_addr, &rules_guard).await
         } else if first_byte[0] == 0x04 {
-            handle_socks4(first_byte[0], stream, peer_addr, rules.clone()).await
+            handle_socks4(first_byte[0], stream, peer_addr, &rules_guard).await
         } else {
-            handle_http(first_byte[0], stream, peer_addr, rules.clone()).await
+            handle_http(first_byte[0], stream, peer_addr, &rules_guard).await
         }
     }).await;
 
@@ -95,7 +98,7 @@ async fn handle_socks4(
     _first_byte: u8,
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    rules: &[(RuleMatcher, ProxyConfig)],
 ) -> Result<(TcpStream, TcpStream, String, u16)> {
     // SOCKS4 header: CMD (1), DSTPORT (2), DSTIP (4)
     let mut header = [0u8; 7];
@@ -158,7 +161,7 @@ async fn handle_socks5(
     _first_byte: u8,
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    rules: &[(RuleMatcher, ProxyConfig)],
 ) -> Result<(TcpStream, TcpStream, String, u16)> {
     // We already read the first byte (version 0x05)
     let mut second_byte = [0u8; 1];
@@ -248,7 +251,7 @@ async fn handle_http(
     first_byte: u8,
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    rules: Vec<(RuleMatcher, ProxyConfig)>,
+    rules: &[(RuleMatcher, ProxyConfig)],
 ) -> Result<(TcpStream, TcpStream, String, u16)> {
     let mut request_line = vec![first_byte];
     let mut byte = [0u8; 1];
