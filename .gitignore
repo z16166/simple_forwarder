@@ -9,4 +9,3 @@
 *.o
 *.a
 *.d
-Cargo.lock
