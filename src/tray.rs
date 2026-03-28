@@ -100,7 +100,9 @@ impl TrayManager {
             }
         });
 
-        tokio::spawn(async move {
+        // Use std::thread (not tokio::spawn) because menu_channel.recv() is a
+        // blocking synchronous call that would monopolize a tokio worker thread.
+        std::thread::spawn(move || {
             while let Ok(event) = menu_channel.recv() {
                 if event.id == quit_id {
                     log::info!("Quit menu selected");
@@ -111,11 +113,24 @@ impl TrayManager {
                             unsafe {
                                 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
                                 use windows::Win32::Foundation::{WPARAM, LPARAM};
-                                // Post custom quit message; message loop will break on WM_USER+2
-                                let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0));
+                                // Try graceful shutdown: post quit message to the message loop
+                                match PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0)) {
+                                    Ok(_) => log::info!("Posted quit message to message loop thread (tid={})", tid),
+                                    Err(e) => {
+                                        log::error!("PostThreadMessageW failed: {}, forcing exit", e);
+                                        std::process::exit(1);
+                                    }
+                                }
                             }
+                            // Fallback: force exit after 3 seconds if graceful shutdown stalls
+                            std::thread::spawn(|| {
+                                std::thread::sleep(Duration::from_secs(3));
+                                log::warn!("Graceful shutdown timed out, forcing exit");
+                                std::process::exit(1);
+                            });
                         } else {
-                            // Fallback if message loop hasn't started yet
+                            // Message loop hasn't started yet — force exit immediately
+                            log::warn!("Message loop not started, forcing exit");
                             std::process::exit(0);
                         }
                     }
