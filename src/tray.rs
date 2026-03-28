@@ -258,7 +258,7 @@ impl TrayManager {
                     if msg.message == WM_USER + 3 {
                         let mem_kb = Self::get_current_memory_usage_kb();
                         let mem_formatted = Self::format_with_commas(mem_kb);
-                        let tooltip = format!("Simple Forwarder\nMemory: {} (KB)", mem_formatted);
+                        let tooltip = format!("Simple Forwarder\nPrivate Memory: {} (KB)", mem_formatted);
                         let _ = self._tray_icon.set_tooltip(Some(tooltip));
                         continue;
                     }
@@ -383,14 +383,18 @@ impl TrayManager {
 
     #[cfg(windows)]
     fn get_current_memory_usage_kb() -> usize {
-        use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
         use windows::Win32::System::Threading::GetCurrentProcess;
         
-        let mut counters = PROCESS_MEMORY_COUNTERS::default();
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
         unsafe {
             let handle = GetCurrentProcess();
-            if GetProcessMemoryInfo(handle, &mut counters, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32).is_ok() {
-                return counters.WorkingSetSize / 1024;
+            if GetProcessMemoryInfo(
+                handle,
+                &mut counters as *mut _ as *mut _,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32
+            ).is_ok() {
+                return counters.PrivateUsage / 1024;
             }
         }
         0
