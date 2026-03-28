@@ -89,7 +89,12 @@ async fn main() -> Result<()> {
 
     tray_manager.run_message_loop();
 
-    Ok(())
+    // run_message_loop() only returns when the user clicks Quit.
+    // The tokio runtime's thread pool (proxy server, config watcher, activity task)
+    // would otherwise keep the process—and its console window—alive indefinitely.
+    // Force a clean exit so everything (including the console) is released immediately.
+    log::info!("Shutting down.");
+    std::process::exit(0);
 }
 
 fn parse_rules(config: &Config) -> Result<Vec<(RuleMatcher, ProxyConfig)>> {
