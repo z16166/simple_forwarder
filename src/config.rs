@@ -40,10 +40,11 @@ fn default_log_level() -> String {
 pub enum LogType {
     Console,
     File,
+    None,
 }
 
 fn default_log_type() -> LogType {
-    LogType::Console
+    LogType::None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

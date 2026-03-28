@@ -21,9 +21,11 @@ Edit `config.yaml` to configure the proxy:
 
 ```yaml
 log:
-  log_type: console  # or "file"
+  log_type: none     # options: "none" (default), "console", "file"
   level: warn        # log level: debug, info, warn, error
   file: null         # required if log_type is "file"
+  flush_interval_secs: 5 # flush interval for file logs (default: 5)
+  flush_count: 100   # flush every N entries for file logs (default: 100)
 
 listen:
   addr: "127.0.0.1"
@@ -60,11 +62,10 @@ The `forward_to` field supports three proxy protocols:
 cargo build --release
 ```
 
-## Windows GUI Mode
-
 On Windows, the application runs as a GUI process by default.
-- If `log_type` is set to `console` in `config.yaml`, a console window will be automatically allocated to show logs.
-- If `log_type` is set to `file` or other values, the application runs silently in the background (accessible via the system tray).
+- **Default (none)**: The application runs silently in the background with no console window. You can interact with it via the system tray.
+- **Console Mode**: If `log_type` is set to `console` in `config.yaml`, a console window will be automatically allocated to show real-time logs.
+- **File Mode**: If `log_type` is set to `file`, logs are written to the specified file with periodic flushing for performance. No console window is shown.
 
 ## Usage
 

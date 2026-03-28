@@ -88,6 +88,9 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
     });
 
     match config.log_type {
+        crate::config::LogType::None => {
+            // Do nothing, no logger initialized and no console allocated
+        }
         crate::config::LogType::Console => {
             alloc_console()?;
             builder.init();
