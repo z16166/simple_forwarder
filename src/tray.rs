@@ -4,9 +4,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY_CURRENT_USER,
+    KEY_ALL_ACCESS, REG_SZ,
+};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+
+#[cfg(windows)]
+const RUN_REGISTRY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
+#[cfg(windows)]
+const REG_APP_NAME: &str = "SimpleForwarder\0";
 
 pub struct TrayManager {
     _tray_icon: TrayIcon,
@@ -19,6 +34,9 @@ pub struct TrayManager {
     hicon_active: windows::Win32::UI::WindowsAndMessaging::HICON,
     #[cfg(windows)]
     hicon_inactive: windows::Win32::UI::WindowsAndMessaging::HICON,
+    autostart_item: CheckMenuItem,
+    quit_id: tray_icon::menu::MenuId,
+    autostart_id: tray_icon::menu::MenuId,
 }
 
 impl TrayManager {
@@ -27,8 +45,25 @@ impl TrayManager {
 
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_id = quit_item.id().clone();
+
+        let autostart_item = CheckMenuItem::new("Run at Startup", true, false, None);
+        let autostart_id = autostart_item.id().clone();
+
+        #[cfg(windows)]
+        {
+            if let Ok(path) = Self::get_quoted_exe_path() {
+                if Self::check_autostart_status(&path) {
+                    autostart_item.set_checked(true);
+                }
+            }
+        }
+
         let menu = Menu::new();
-        menu.append(&quit_item)?;
+        menu.append_items(&[
+            &autostart_item,
+            &tray_icon::menu::PredefinedMenuItem::separator(),
+            &quit_item,
+        ])?;
 
         let icon_active_bytes = Self::create_simple_icon(true)?;
         let icon_inactive_bytes = Self::create_simple_icon(false)?;
@@ -57,9 +92,12 @@ impl TrayManager {
         let thread_id_for_activity = msg_thread_id.clone();
         let thread_id_for_menu = msg_thread_id.clone();
 
+        let mut rx = rx;
+        let quit_id_for_loop = quit_id.clone();
+        let autostart_id_for_loop = autostart_id.clone();
+
         tokio::spawn(async move {
             let mut last_activity = std::time::Instant::now();
-            let mut rx = rx;
             let mut currently_active = false;
 
             log::debug!("Activity detection task started");
@@ -115,48 +153,6 @@ impl TrayManager {
             }
         });
 
-        // Use std::thread (not tokio::spawn) because menu_channel.recv() is a
-        // blocking synchronous call that would monopolize a tokio worker thread.
-        std::thread::spawn(move || {
-            while let Ok(event) = menu_channel.recv() {
-                if event.id == quit_id {
-                    log::info!("Quit menu selected");
-                    #[cfg(windows)]
-                    {
-                        let tid = thread_id_for_menu.load(Ordering::Acquire);
-                        if tid != 0 {
-                            unsafe {
-                                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                use windows::Win32::Foundation::{WPARAM, LPARAM};
-                                // Try graceful shutdown: post quit message to the message loop
-                                match PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0)) {
-                                    Ok(_) => log::info!("Posted quit message to message loop thread (tid={})", tid),
-                                    Err(e) => {
-                                        log::error!("PostThreadMessageW failed: {}, forcing exit", e);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            // Fallback: force exit after 3 seconds if graceful shutdown stalls
-                            std::thread::spawn(|| {
-                                std::thread::sleep(Duration::from_secs(3));
-                                log::warn!("Graceful shutdown timed out, forcing exit");
-                                std::process::exit(1);
-                            });
-                        } else {
-                            // Message loop hasn't started yet — force exit immediately
-                            log::warn!("Message loop not started, forcing exit");
-                            std::process::exit(0);
-                        }
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        std::process::exit(0);
-                    }
-                }
-            }
-        });
-
         let tray_event_channel = TrayIconEvent::receiver();
         let tid_for_events = msg_thread_id.clone();
         std::thread::spawn(move || {
@@ -196,6 +192,9 @@ impl TrayManager {
             hicon_active,
             #[cfg(windows)]
             hicon_inactive,
+            autostart_item,
+            quit_id: quit_id_for_loop,
+            autostart_id: autostart_id_for_loop,
         })
     }
 
@@ -204,7 +203,7 @@ impl TrayManager {
         {
             use windows::Win32::UI::WindowsAndMessaging::{
                 DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_USER,
-                WM_SETICON, ICON_SMALL, ICON_BIG, DestroyIcon, HICON,
+                WM_SETICON, ICON_SMALL, ICON_BIG, DestroyIcon,
             };
             use windows::Win32::System::Console::GetConsoleWindow;
             use windows::Win32::Foundation::{WPARAM, LPARAM};
@@ -218,6 +217,37 @@ impl TrayManager {
                 log::debug!("Starting Win32 message loop (thread id={})", tid);
                 let mut hwnd_console = GetConsoleWindow();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    // Check for menu events from the receiver (non-blocking)
+                    while let Ok(event) = MenuEvent::receiver().try_recv() {
+                        if event.id == self.quit_id {
+                            log::info!("Quit menu selected");
+                            let tid = self.msg_loop_thread_id.load(Ordering::Acquire);
+                            if tid != 0 {
+                                // Graceful exit from the message loop
+                                use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+                                let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0));
+                                // Fallback: force exit after 3 seconds if graceful shutdown stalls
+                                std::thread::spawn(|| {
+                                    std::thread::sleep(Duration::from_secs(3));
+                                    log::warn!("Graceful shutdown timed out, forcing exit");
+                                    std::process::exit(1);
+                                });
+                            } else {
+                                std::process::exit(0);
+                            }
+                        } else if event.id == self.autostart_id {
+                            let is_checked = self.autostart_item.is_checked();
+                            log::info!("Toggle Run at Startup: {}", is_checked);
+                            if let Ok(path) = Self::get_quoted_exe_path() {
+                                if let Err(e) = Self::set_autostart(&path, is_checked) {
+                                    log::error!("Failed to update autostart registry: {}", e);
+                                    // Revert checkbox on failure
+                                    self.autostart_item.set_checked(!is_checked);
+                                }
+                            }
+                        }
+                    }
+
                     // WM_USER+2: graceful quit request from menu handler
                     if msg.message == WM_USER + 2 {
                         log::info!("Quit message received, exiting message loop");
@@ -383,5 +413,99 @@ impl TrayManager {
             result.push(b as char);
         }
         result
+    }
+
+    #[cfg(windows)]
+    fn get_quoted_exe_path() -> Result<String> {
+        let path = std::env::current_exe()?;
+        let path_str = path.to_string_lossy().to_string();
+        
+        // Convert to long path name to ensure registry consistency
+        let wide_path: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buffer = [0u16; 1024];
+        let len = unsafe { GetLongPathNameW(PCWSTR(wide_path.as_ptr()), Some(&mut buffer)) };
+        
+        let final_path = if len > 0 && (len as usize) < buffer.len() {
+            String::from_utf16_lossy(&buffer[..len as usize])
+        } else {
+            path_str
+        };
+
+        Ok(format!("\"{}\"", final_path))
+    }
+
+    #[cfg(windows)]
+    fn check_autostart_status(expected_path: &str) -> bool {
+        unsafe {
+            let mut hkey = windows::Win32::System::Registry::HKEY::default();
+            let subkey: Vec<u16> = RUN_REGISTRY_PATH
+                .encode_utf16()
+                .collect();
+            
+            use windows::Win32::Foundation::ERROR_SUCCESS;
+            if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_ALL_ACCESS, &mut hkey) != ERROR_SUCCESS {
+                return false;
+            }
+
+            let value_name: Vec<u16> = REG_APP_NAME.encode_utf16().collect();
+            let mut buffer = [0u16; 1024];
+            let mut len = (buffer.len() * 2) as u32;
+            let mut dw_type = windows::Win32::System::Registry::REG_VALUE_TYPE::default();
+
+            let res = RegQueryValueExW(
+                hkey,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                Some(&mut dw_type),
+                Some(buffer.as_mut_ptr() as *mut _),
+                Some(&mut len),
+            );
+
+            let _ = RegCloseKey(hkey);
+
+            if res == ERROR_SUCCESS && dw_type == REG_SZ {
+                let actual_path = String::from_utf16_lossy(&buffer[..(len / 2).saturating_sub(1) as usize]);
+                return actual_path.to_lowercase() == expected_path.to_lowercase();
+            }
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    fn set_autostart(path: &str, enabled: bool) -> Result<()> {
+        unsafe {
+            let mut hkey = windows::Win32::System::Registry::HKEY::default();
+            let subkey: Vec<u16> = RUN_REGISTRY_PATH
+                .encode_utf16()
+                .collect();
+            
+            use windows::Win32::Foundation::ERROR_SUCCESS;
+            let status = RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_ALL_ACCESS, &mut hkey);
+            if status != ERROR_SUCCESS {
+                return Err(anyhow::anyhow!("Failed to open registry key: error code {}", status.0));
+            }
+
+            let value_name: Vec<u16> = REG_APP_NAME.encode_utf16().collect();
+            
+            let res = if enabled {
+                let path_wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                let data = std::slice::from_raw_parts(path_wide.as_ptr() as *const u8, path_wide.len() * 2);
+                RegSetValueExW(
+                    hkey,
+                    PCWSTR(value_name.as_ptr()),
+                    0,
+                    REG_SZ,
+                    Some(data),
+                )
+            } else {
+                RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr()))
+            };
+
+            let _ = RegCloseKey(hkey);
+            if res != ERROR_SUCCESS {
+                return Err(anyhow::anyhow!("Registry operation failed: error code {}", res.0));
+            }
+        }
+        Ok(())
     }
 }

@@ -10,8 +10,9 @@ A high-performance Multi-Protocol Proxy Forwarder written in Rust 2024 Edition.
 - **Domain Wildcard Matching**: Support for `*.domain.com` which matches both subdomains and the root domain.
 - **Hot-Reloading**: Automatically detects changes to `config.yaml` and reloads routing rules without service interruption using RCU-style updates (`arc-swap`).
 - **IP and CIDR Matching**: Supports both IPv4 and IPv6 address/range matching.
+- **Run at Startup**: Optional setting in the system tray menu to automatically launch the application on system login via the Windows Registry.
 - **Asynchronous I/O**: High performance using the Tokio runtime.
-- **System Tray support**: Visual traffic indicator (gray/green) and easy exit menu.
+- **System Tray support**: Visual traffic indicator (gray/green), autostart toggle, and easy exit menu.
 - **Cross-platform**: Support for Windows, macOS, and Linux.
 - **Configurable logging**: Detailed console or file-based logs with local-time support.
 
