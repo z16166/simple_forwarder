@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::time::{Duration, Instant};
 
 use crate::config::LogConfig;
 
@@ -15,6 +17,49 @@ fn alloc_console() -> Result<()> {
 #[cfg(not(windows))]
 fn alloc_console() -> Result<()> {
     Ok(())
+}
+
+struct FlushingWriter {
+    writer: BufWriter<std::fs::File>,
+    count: usize,
+    flush_count: usize,
+    flush_interval: Duration,
+    last_flush: Instant,
+}
+
+impl FlushingWriter {
+    fn new(file: std::fs::File, flush_count: usize, flush_interval: Duration) -> Self {
+        Self {
+            writer: BufWriter::new(file),
+            count: 0,
+            flush_count,
+            flush_interval,
+            last_flush: Instant::now(),
+        }
+    }
+}
+
+impl Write for FlushingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let n = self.writer.write(buf)?;
+        
+        // Each log entry results in one or more write calls.
+        self.count += 1;
+        if self.count >= self.flush_count || self.last_flush.elapsed() >= self.flush_interval {
+            self.writer.flush()?;
+            self.count = 0;
+            self.last_flush = Instant::now();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 pub fn setup_logger(config: &LogConfig) -> Result<()> {
@@ -57,7 +102,13 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
                 .open(log_file)
                 .with_context(|| format!("Failed to open log file: {}", log_file))?;
 
-            builder.target(env_logger::Target::Pipe(Box::new(file))).init();
+            let flushing_writer = FlushingWriter::new(
+                file,
+                config.flush_count,
+                Duration::from_secs(config.flush_interval_secs),
+            );
+
+            builder.target(env_logger::Target::Pipe(Box::new(flushing_writer))).init();
         }
     }
 

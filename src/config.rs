@@ -17,6 +17,18 @@ pub struct LogConfig {
     pub file: Option<String>,
     #[serde(default = "default_log_level")]
     pub level: String,
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    #[serde(default = "default_flush_count")]
+    pub flush_count: usize,
+}
+
+fn default_flush_interval_secs() -> u64 {
+    5
+}
+
+fn default_flush_count() -> usize {
+    100
 }
 
 fn default_log_level() -> String {

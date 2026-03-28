@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
-    TrayIcon, TrayIconBuilder,
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 pub struct TrayManager {
@@ -28,7 +28,7 @@ impl TrayManager {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
-            .with_tooltip("Simple Forwarder")
+            .with_tooltip("Simple Forwarder\nMemory: Calculating...")
             .with_icon(tray_icon::Icon::from_rgba(icon_bytes, 32, 32)?)
             .build()?;
 
@@ -142,6 +142,34 @@ impl TrayManager {
             }
         });
 
+        let tray_event_channel = TrayIconEvent::receiver();
+        let tid_for_events = msg_thread_id.clone();
+        std::thread::spawn(move || {
+            let mut last_update = std::time::Instant::now();
+            while let Ok(event) = tray_event_channel.recv() {
+                match event {
+                    TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. } => {
+                        // Throttle updates to at most once per 200ms to avoid flooding
+                        if last_update.elapsed() > Duration::from_millis(200) {
+                            #[cfg(windows)]
+                            {
+                                let tid = tid_for_events.load(Ordering::Acquire);
+                                if tid != 0 {
+                                    unsafe {
+                                        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+                                        use windows::Win32::Foundation::{WPARAM, LPARAM};
+                                        let _ = PostThreadMessageW(tid, WM_USER + 3, WPARAM(0), LPARAM(0));
+                                    }
+                                }
+                            }
+                            last_update = std::time::Instant::now();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
         Ok(Self {
             _tray_icon: tray_icon,
             _is_active: is_active,
@@ -178,6 +206,15 @@ impl TrayManager {
                             let _ = DestroyIcon(old_hicon);
                         }
                         break;
+                    }
+
+                    // WM_USER+3: tooltip update request (hover/move)
+                    if msg.message == WM_USER + 3 {
+                        let mem_kb = Self::get_current_memory_usage_kb();
+                        let mem_formatted = Self::format_with_commas(mem_kb);
+                        let tooltip = format!("Simple Forwarder\nMemory: {} (KB)", mem_formatted);
+                        let _ = self._tray_icon.set_tooltip(Some(tooltip));
+                        continue;
                     }
 
                     if msg.message == WM_USER + 1 {
@@ -307,5 +344,39 @@ impl TrayManager {
         }
 
         Ok(rgba)
+    }
+
+    #[cfg(windows)]
+    fn get_current_memory_usage_kb() -> usize {
+        use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        
+        let mut counters = PROCESS_MEMORY_COUNTERS::default();
+        unsafe {
+            let handle = GetCurrentProcess();
+            if GetProcessMemoryInfo(handle, &mut counters, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32).is_ok() {
+                return counters.WorkingSetSize / 1024;
+            }
+        }
+        0
+    }
+
+    #[cfg(not(windows))]
+    fn get_current_memory_usage_kb() -> usize {
+        0
+    }
+
+    fn format_with_commas(n: usize) -> String {
+        let s = n.to_string();
+        let mut result = String::new();
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        for (i, &b) in bytes.iter().enumerate() {
+            if i > 0 && (len - i) % 3 == 0 {
+                result.push(',');
+            }
+            result.push(b as char);
+        }
+        result
     }
 }
