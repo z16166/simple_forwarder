@@ -336,12 +336,39 @@ async fn handle_http(
         }
         stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
     } else {
-        // Regular GET/POST request: forward the original request line and headers
-        
-        // Forward the modified request line if connecting directly,
-        // or the original if connecting to an upstream proxy.
-        // For simplicity, we'll try to forward the headers and original request line first.
-        target_stream.write_all(&request_line).await?;
+        // Regular GET/POST request: rewrite the request line to origin-form and forward.
+        //
+        // RFC 7230 §5.3.2 / §5.7.2: browsers talking through an HTTP proxy send the
+        // request-target in absolute-form ("GET http://host/path HTTP/1.1"). When this
+        // proxy forwards the request directly to the origin server it MUST convert that
+        // to origin-form ("GET /path HTTP/1.1"); only an upstream HTTP proxy expects
+        // absolute-form. Sending absolute-form to an origin server causes HTTP 400.
+        let rewritten_line: Vec<u8> = if uri.starts_with("http://") || uri.starts_with("https://") {
+            // Parse out path+query from the absolute URI and rebuild the request line.
+            let origin = if let Ok(parsed) = uri.parse::<http::Uri>() {
+                let path = parsed.path();
+                let path = if path.is_empty() { "/" } else { path };
+                match parsed.query() {
+                    Some(q) => format!("{path}?{q}"),
+                    None    => path.to_string(),
+                }
+            } else {
+                // Fallback: strip scheme+authority manually
+                let after_scheme = &uri[uri.find("://").map(|i| i + 3).unwrap_or(0)..];
+                let path_start = after_scheme.find('/').map(|i| i).unwrap_or(after_scheme.len());
+                let path = &after_scheme[path_start..];
+                if path.is_empty() { "/".to_string() } else { path.to_string() }
+            };
+            let version = if parts.len() >= 3 { parts[2] } else { "HTTP/1.1" };
+            format!("{method} {origin} {version}\r\n").into_bytes()
+        } else {
+            // Already origin-form (Edge sends this); forward as-is.
+            request_line.clone()
+        };
+
+        log::debug!("Forwarding request line (origin-form): {}",
+            String::from_utf8_lossy(&rewritten_line).trim());
+        target_stream.write_all(&rewritten_line).await?;
 
         // Relay headers until \r\n\r\n
         let mut header_buf = [0u8; 1];
