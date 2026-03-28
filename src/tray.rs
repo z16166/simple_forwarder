@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -12,6 +12,7 @@ pub struct TrayManager {
     _tray_icon: TrayIcon,
     _is_active: Arc<AtomicBool>,
     _menu: Option<Menu>,
+    msg_loop_thread_id: Arc<AtomicU32>,
 }
 
 impl TrayManager {
@@ -35,9 +36,11 @@ impl TrayManager {
         let menu_channel = MenuEvent::receiver();
 
         let is_active_clone = is_active.clone();
-        
-        #[cfg(windows)]
-        let main_thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+
+        // Thread ID will be set when run_message_loop() starts on the actual message loop thread.
+        let msg_thread_id = Arc::new(AtomicU32::new(0));
+        let thread_id_for_activity = msg_thread_id.clone();
+        let thread_id_for_menu = msg_thread_id.clone();
 
         tokio::spawn(async move {
             let mut last_activity = std::time::Instant::now();
@@ -59,11 +62,16 @@ impl TrayManager {
                             log::debug!("Activity detected, switching icon to active");
                             is_active_clone.store(true, Ordering::Relaxed);
                             #[cfg(windows)]
-                            unsafe {
-                                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                let success = PostThreadMessageW(main_thread_id, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
-                                if let Err(e) = success {
-                                    log::error!("Failed to post active message to main thread: {}", e);
+                            {
+                                let tid = thread_id_for_activity.load(Ordering::Acquire);
+                                if tid != 0 {
+                                    unsafe {
+                                        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+                                        let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
+                                        if let Err(e) = success {
+                                            log::error!("Failed to post active message to main thread: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -74,11 +82,16 @@ impl TrayManager {
                             log::debug!("Inactivity detected, switching icon to inactive");
                             is_active_clone.store(false, Ordering::Relaxed);
                             #[cfg(windows)]
-                            unsafe {
-                                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                let success = PostThreadMessageW(main_thread_id, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
-                                if let Err(e) = success {
-                                    log::error!("Failed to post inactive message to main thread: {}", e);
+                            {
+                                let tid = thread_id_for_activity.load(Ordering::Acquire);
+                                if tid != 0 {
+                                    unsafe {
+                                        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+                                        let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+                                        if let Err(e) = success {
+                                            log::error!("Failed to post inactive message to main thread: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -91,7 +104,25 @@ impl TrayManager {
             while let Ok(event) = menu_channel.recv() {
                 if event.id == quit_id {
                     log::info!("Quit menu selected");
-                    std::process::exit(0);
+                    #[cfg(windows)]
+                    {
+                        let tid = thread_id_for_menu.load(Ordering::Acquire);
+                        if tid != 0 {
+                            unsafe {
+                                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+                                use windows::Win32::Foundation::{WPARAM, LPARAM};
+                                // Post custom quit message; message loop will break on WM_USER+2
+                                let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0));
+                            }
+                        } else {
+                            // Fallback if message loop hasn't started yet
+                            std::process::exit(0);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        std::process::exit(0);
+                    }
                 }
             }
         });
@@ -100,6 +131,7 @@ impl TrayManager {
             _tray_icon: tray_icon,
             _is_active: is_active,
             _menu: Some(menu_clone),
+            msg_loop_thread_id: msg_thread_id,
         })
     }
 
@@ -114,12 +146,25 @@ impl TrayManager {
             use windows::Win32::Foundation::{WPARAM, LPARAM};
 
             unsafe {
+                // Store thread ID so tokio tasks can post messages to this thread.
+                let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                self.msg_loop_thread_id.store(tid, Ordering::Release);
+
                 let mut msg = MSG::default();
-                log::debug!("Starting Win32 message loop");
+                log::debug!("Starting Win32 message loop (thread id={})", tid);
                 let mut hwnd_console = GetConsoleWindow();
                 let mut last_hicon: Option<HICON> = None;
 
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    // WM_USER+2: graceful quit request from menu handler
+                    if msg.message == WM_USER + 2 {
+                        log::info!("Quit message received, exiting message loop");
+                        if let Some(old_hicon) = last_hicon.take() {
+                            let _ = DestroyIcon(old_hicon);
+                        }
+                        break;
+                    }
+
                     if msg.message == WM_USER + 1 {
                         let active = msg.wParam.0 != 0;
                         log::debug!("Received UI update message: active={}", active);

@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{timeout, Duration};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_CONNECTIONS: usize = 1024;
 
 use crate::matcher::RuleMatcher;
 use crate::proxy_client::{ProxyClient, ProxyConfig};
@@ -19,6 +20,7 @@ pub struct ProxyServer {
     listener: TcpListener,
     tx: mpsc::Sender<()>,
     rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl ProxyServer {
@@ -35,6 +37,7 @@ impl ProxyServer {
             listener,
             tx,
             rules,
+            semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         })
     }
 
@@ -43,12 +46,21 @@ impl ProxyServer {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     log::debug!("Accepted connection from {}", peer_addr);
-                    let _ = self.tx.send(()).await;
+                    let _ = self.tx.try_send(());
 
                     let tx = self.tx.clone();
                     let rules = self.rules.clone();
+                    let permit = match self.semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            log::warn!("Max connections ({}) reached, rejecting {}", MAX_CONNECTIONS, peer_addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_connection(stream, peer_addr, rules, tx).await {
                             log::error!("Error handling connection from {}: {}", peer_addr, e);
                         }
@@ -278,14 +290,25 @@ async fn handle_http(
     let uri = parts[1];
 
     let (host, port, is_connect) = if method.to_uppercase() == "CONNECT" {
-        let host_port: Vec<&str> = uri.split(':').collect();
-        let host = host_port[0].to_string();
-        let port = if host_port.len() > 1 {
-            host_port[1].parse().unwrap_or(443)
+        if uri.starts_with('[') {
+            // IPv6: [::1]:443
+            let end_bracket = uri.find(']')
+                .ok_or_else(|| anyhow::anyhow!("Invalid IPv6 CONNECT URI: {}", uri))?;
+            let host = uri[1..end_bracket].to_string();
+            let port = if uri.len() > end_bracket + 2 && uri.as_bytes()[end_bracket + 1] == b':' {
+                uri[end_bracket + 2..].parse().unwrap_or(443)
+            } else {
+                443
+            };
+            (host, port, true)
         } else {
-            443
-        };
-        (host, port, true)
+            // IPv4 or domain: host:port
+            let (host, port) = match uri.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
+                None => (uri.to_string(), 443),
+            };
+            (host, port, true)
+        }
     } else {
         let uri_parsed = uri.parse::<http::Uri>().map_err(|_| anyhow::anyhow!("Failed to parse URI: {}", uri))?;
         let host = uri_parsed.host().ok_or_else(|| anyhow::anyhow!("Missing host in HTTP URI"))?.to_string();
@@ -393,7 +416,7 @@ async fn relay_data(
     peer_addr: SocketAddr,
     tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let _ = tx.send(()).await;
+    let _ = tx.try_send(());
 
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
@@ -401,45 +424,50 @@ async fn relay_data(
     let client_to_target = async {
         let mut buf = [0u8; 8192];
         loop {
-            let read_future = client_reader.read(&mut buf);
-            match timeout(IDLE_TIMEOUT, read_future).await {
+            match timeout(IDLE_TIMEOUT, client_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     target_writer.write_all(&buf[..n]).await?;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
             }
         }
-        target_writer.shutdown().await?;
-        Ok::<(), anyhow::Error>(())
+        let _ = target_writer.shutdown().await;
+        Ok(())
     };
 
     let target_to_client = async {
         let mut buf = [0u8; 8192];
         loop {
-            let read_future = target_reader.read(&mut buf);
-            match timeout(IDLE_TIMEOUT, read_future).await {
+            match timeout(IDLE_TIMEOUT, target_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     client_writer.write_all(&buf[..n]).await?;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
             }
         }
-        client_writer.shutdown().await?;
-        Ok::<(), anyhow::Error>(())
+        let _ = client_writer.shutdown().await;
+        Ok(())
     };
 
-    let (c2t, t2c) = tokio::join!(client_to_target, target_to_client);
-
-    if let Err(e) = c2t {
-        log::debug!("Client to target relay finished: {}", e);
+    // select! cancels the other direction immediately when one finishes,
+    // preventing stale half-connections from lingering for IDLE_TIMEOUT.
+    tokio::select! {
+        r = client_to_target => {
+            if let Err(e) = r {
+                log::debug!("Client→Target relay error: {}", e);
+            }
+        }
+        r = target_to_client => {
+            if let Err(e) = r {
+                log::debug!("Target→Client relay error: {}", e);
+            }
+        }
     }
-    if let Err(e) = t2c {
-        log::debug!("Target to client relay finished: {}", e);
-    }
+    // Remaining stream halves are dropped here, closing both connections
 
     log::info!("Connection from {} to {}:{} closed", peer_addr, host, port);
     Ok(())
