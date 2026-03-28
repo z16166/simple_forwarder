@@ -13,6 +13,12 @@ pub struct TrayManager {
     _is_active: Arc<AtomicBool>,
     _menu: Option<Menu>,
     msg_loop_thread_id: Arc<AtomicU32>,
+    icon_active: tray_icon::Icon,
+    icon_inactive: tray_icon::Icon,
+    #[cfg(windows)]
+    hicon_active: windows::Win32::UI::WindowsAndMessaging::HICON,
+    #[cfg(windows)]
+    hicon_inactive: windows::Win32::UI::WindowsAndMessaging::HICON,
 }
 
 impl TrayManager {
@@ -24,12 +30,21 @@ impl TrayManager {
         let menu = Menu::new();
         menu.append(&quit_item)?;
 
-        let icon_bytes = Self::create_simple_icon(false)?;
+        let icon_active_bytes = Self::create_simple_icon(true)?;
+        let icon_inactive_bytes = Self::create_simple_icon(false)?;
+
+        let icon_active = tray_icon::Icon::from_rgba(icon_active_bytes.clone(), 32, 32)?;
+        let icon_inactive = tray_icon::Icon::from_rgba(icon_inactive_bytes.clone(), 32, 32)?;
+
+        #[cfg(windows)]
+        let hicon_active = Self::create_hicon_from_rgba(&icon_active_bytes, 32, 32)?;
+        #[cfg(windows)]
+        let hicon_inactive = Self::create_hicon_from_rgba(&icon_inactive_bytes, 32, 32)?;
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
             .with_tooltip("Simple Forwarder\nMemory: Calculating...")
-            .with_icon(tray_icon::Icon::from_rgba(icon_bytes, 32, 32)?)
+            .with_icon(icon_inactive.clone())
             .build()?;
 
         let menu_clone = menu.clone();
@@ -175,6 +190,12 @@ impl TrayManager {
             _is_active: is_active,
             _menu: Some(menu_clone),
             msg_loop_thread_id: msg_thread_id,
+            icon_active,
+            icon_inactive,
+            #[cfg(windows)]
+            hicon_active,
+            #[cfg(windows)]
+            hicon_inactive,
         })
     }
 
@@ -196,15 +217,10 @@ impl TrayManager {
                 let mut msg = MSG::default();
                 log::debug!("Starting Win32 message loop (thread id={})", tid);
                 let mut hwnd_console = GetConsoleWindow();
-                let mut last_hicon: Option<HICON> = None;
-
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     // WM_USER+2: graceful quit request from menu handler
                     if msg.message == WM_USER + 2 {
                         log::info!("Quit message received, exiting message loop");
-                        if let Some(old_hicon) = last_hicon.take() {
-                            let _ = DestroyIcon(old_hicon);
-                        }
                         break;
                     }
 
@@ -221,46 +237,36 @@ impl TrayManager {
                         let active = msg.wParam.0 != 0;
                         log::debug!("Received UI update message: active={}", active);
 
+                        // Update Tray Icon using cached icons
+                        let icon = if active { &self.icon_active } else { &self.icon_inactive };
+                        if let Err(e) = self._tray_icon.set_icon(Some(icon.clone())) {
+                            log::error!("Failed to set tray icon: {}", e);
+                        }
+
                         // Lazy re-check for console window if not found initially
                         if hwnd_console.0.is_null() {
                             hwnd_console = GetConsoleWindow();
                         }
 
-                        if let Ok(icon_bytes) = Self::create_simple_icon(active) {
-                            // Update Tray Icon
-                            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_bytes.clone(), 32, 32) {
-                                if let Err(e) = self._tray_icon.set_icon(Some(icon)) {
-                                    log::error!("Failed to set tray icon: {}", e);
-                                }
+                        // Update Taskbar Icon (if console exists) using cached hicons
+                        if !hwnd_console.0.is_null() {
+                            let hicon = if active { self.hicon_active } else { self.hicon_inactive };
+                            use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM};
+
+                            // Try both SendMessage and SetClassLongPtr for maximum compatibility
+                            let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+                            let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+                            
+                            #[cfg(target_pointer_width = "64")]
+                            {
+                                let _ = SetClassLongPtrW(hwnd_console, GCLP_HICON, hicon.0 as isize);
+                                let _ = SetClassLongPtrW(hwnd_console, GCLP_HICONSM, hicon.0 as isize);
                             }
-
-                            // Update Taskbar Icon (if console exists)
-                            if !hwnd_console.0.is_null() {
-                                if let Ok(hicon) = Self::create_hicon_from_rgba(&icon_bytes, 32, 32) {
-                                    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM};
-
-                                    // Try both SendMessage and SetClassLongPtr for maximum compatibility
-                                    let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
-                                    let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
-                                    
-                                    #[cfg(target_pointer_width = "64")]
-                                    {
-                                        let _ = SetClassLongPtrW(hwnd_console, GCLP_HICON, hicon.0 as isize);
-                                        let _ = SetClassLongPtrW(hwnd_console, GCLP_HICONSM, hicon.0 as isize);
-                                    }
-                                    #[cfg(target_pointer_width = "32")]
-                                    {
-                                        use windows::Win32::UI::WindowsAndMessaging::{SetClassLongW, GCL_HICON, GCL_HICONSM};
-                                        let _ = SetClassLongW(hwnd_console, GCL_HICON, hicon.0 as i32);
-                                        let _ = SetClassLongW(hwnd_console, GCL_HICONSM, hicon.0 as i32);
-                                    }
-                                    
-                                    // Cleanup previous icon to prevent leaks
-                                    if let Some(old_hicon) = last_hicon {
-                                        let _ = DestroyIcon(old_hicon);
-                                    }
-                                    last_hicon = Some(hicon);
-                                }
+                            #[cfg(target_pointer_width = "32")]
+                            {
+                                use windows::Win32::UI::WindowsAndMessaging::{SetClassLongW, GCL_HICON, GCL_HICONSM};
+                                let _ = SetClassLongW(hwnd_console, GCL_HICON, hicon.0 as i32);
+                                let _ = SetClassLongW(hwnd_console, GCL_HICONSM, hicon.0 as i32);
                             }
                         }
                         continue;
@@ -269,10 +275,9 @@ impl TrayManager {
                     DispatchMessageW(&msg);
                 }
                 
-                // Final cleanup
-                if let Some(old_hicon) = last_hicon {
-                    let _ = DestroyIcon(old_hicon);
-                }
+                // Final cleanup of cached handles
+                let _ = DestroyIcon(self.hicon_active);
+                let _ = DestroyIcon(self.hicon_inactive);
             }
         }
         #[cfg(not(windows))]
