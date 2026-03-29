@@ -1,0 +1,32 @@
+   Compiling simple_forwarder v0.1.0 (F:\Rust\simple_forwarder)
+warning: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `\\?\F:\Rust\simple_forwarder\target\x86_64-pc-windows-msvc\debug\incremental\simple_forwarder-1d72qvca6bo4p\s-hh2ynza907-1vgm6xu-working`
+
+error[E0425]: cannot find value `tx` in this scope
+  --> src\tray.rs:90:29
+   |
+90 |         let (tx, mut rx) = (tx, rx);
+   |                             ^^
+   |
+help: a local variable with a similar name exists
+   |
+90 -         let (tx, mut rx) = (tx, rx);
+90 +         let (tx, mut rx) = (rx, rx);
+   |
+
+error[E0425]: cannot find function, tuple struct or tuple variant `PostThreadMessageW` in this scope
+   --> src\tray.rs:222:41
+    |
+222 | ...                   let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0));
+    |                               ^^^^^^^^^^^^^^^^^^ not found in this scope
+
+warning: unused import: `HICON`
+   --> src\tray.rs:201:64
+    |
+201 |                 WM_SETICON, ICON_SMALL, ICON_BIG, DestroyIcon, HICON,
+    |                                                                ^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `simple_forwarder` (bin "simple_forwarder") generated 2 warnings
+error: could not compile `simple_forwarder` (bin "simple_forwarder") due to 2 previous errors; 2 warnings emitted

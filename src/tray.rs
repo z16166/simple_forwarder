@@ -7,6 +7,7 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+use crate::stats::TrafficStats;
 
 #[cfg(windows)]
 use windows::core::PCWSTR;
@@ -37,10 +38,13 @@ pub struct TrayManager {
     autostart_item: CheckMenuItem,
     quit_id: tray_icon::menu::MenuId,
     autostart_id: tray_icon::menu::MenuId,
+    stats_id: tray_icon::menu::MenuId,
+    stats: Arc<TrafficStats>,
+    is_dialog_open: Arc<AtomicBool>,
 }
 
 impl TrayManager {
-    pub fn new(rx: mpsc::Receiver<()>) -> Result<Self> {
+    pub fn new(rx: mpsc::Receiver<()>, stats: Arc<TrafficStats>) -> Result<Self> {
         let is_active = Arc::new(AtomicBool::new(false));
 
         let quit_item = MenuItem::new("Quit", true, None);
@@ -48,6 +52,9 @@ impl TrayManager {
 
         let autostart_item = CheckMenuItem::new("Run at Startup", true, false, None);
         let autostart_id = autostart_item.id().clone();
+
+        let stats_item = MenuItem::new("Traffic Statistics...", true, None);
+        let stats_id = stats_item.id().clone();
 
         #[cfg(windows)]
         {
@@ -60,6 +67,8 @@ impl TrayManager {
 
         let menu = Menu::new();
         menu.append_items(&[
+            &stats_item,
+            &tray_icon::menu::PredefinedMenuItem::separator(),
             &autostart_item,
             &tray_icon::menu::PredefinedMenuItem::separator(),
             &quit_item,
@@ -83,18 +92,19 @@ impl TrayManager {
             .build()?;
 
         let menu_clone = menu.clone();
-        let menu_channel = MenuEvent::receiver();
+        let _menu_channel = MenuEvent::receiver();
 
         let is_active_clone = is_active.clone();
 
         // Thread ID will be set when run_message_loop() starts on the actual message loop thread.
         let msg_thread_id = Arc::new(AtomicU32::new(0));
         let thread_id_for_activity = msg_thread_id.clone();
-        let thread_id_for_menu = msg_thread_id.clone();
+        let _thread_id_for_menu = msg_thread_id.clone();
 
         let mut rx = rx;
         let quit_id_for_loop = quit_id.clone();
         let autostart_id_for_loop = autostart_id.clone();
+        let stats_id_for_loop = stats_id.clone();
 
         tokio::spawn(async move {
             let mut last_activity = std::time::Instant::now();
@@ -195,6 +205,9 @@ impl TrayManager {
             autostart_item,
             quit_id: quit_id_for_loop,
             autostart_id: autostart_id_for_loop,
+            stats_id: stats_id_for_loop,
+            stats,
+            is_dialog_open: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -204,9 +217,11 @@ impl TrayManager {
             use windows::Win32::UI::WindowsAndMessaging::{
                 DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_USER,
                 WM_SETICON, ICON_SMALL, ICON_BIG, DestroyIcon,
+                MessageBoxW, MB_OK, MB_ICONINFORMATION,
             };
             use windows::Win32::System::Console::GetConsoleWindow;
             use windows::Win32::Foundation::{WPARAM, LPARAM};
+            use windows::core::HSTRING;
 
             unsafe {
                 // Store thread ID so tokio tasks can post messages to this thread.
@@ -245,6 +260,47 @@ impl TrayManager {
                                     self.autostart_item.set_checked(!is_checked);
                                 }
                             }
+                        } else if event.id == self.stats_id {
+                            let lock = self.is_dialog_open.clone();
+                            if lock.swap(true, Ordering::SeqCst) {
+                                // Already open
+                                continue;
+                            }
+
+                            let stats = self.stats.clone();
+                            std::thread::spawn(move || {
+                                #[cfg(windows)]
+                                {
+                                    let mem_kb = TrayManager::get_current_memory_usage_kb();
+                                    let mem_formatted = TrayManager::format_with_commas(mem_kb);
+
+                                    let direct_in = TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
+                                    let direct_out = TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
+                                    let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
+                                    let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
+
+                                    let stats_text = format!(
+                                        "Memory Usage: {} KB (Private Mapping)\n\n\
+                                         - Direct Traffic -\n\
+                                         Inbound: {}\n\
+                                         Outbound: {}\n\n\
+                                         - Proxy Traffic -\n\
+                                         Inbound: {}\n\
+                                         Outbound: {}",
+                                        mem_formatted, direct_in, direct_out, upstream_in, upstream_out
+                                    );
+
+                                    unsafe {
+                                        MessageBoxW(
+                                            None,
+                                            &HSTRING::from(&stats_text),
+                                            &HSTRING::from("Simple Forwarder Status"),
+                                            MB_OK | MB_ICONINFORMATION,
+                                        );
+                                    }
+                                }
+                                lock.store(false, Ordering::SeqCst);
+                            });
                         }
                     }
 
@@ -256,10 +312,7 @@ impl TrayManager {
 
                     // WM_USER+3: tooltip update request (hover/move)
                     if msg.message == WM_USER + 3 {
-                        let mem_kb = Self::get_current_memory_usage_kb();
-                        let mem_formatted = Self::format_with_commas(mem_kb);
-                        let tooltip = format!("Simple Forwarder\nPrivate Memory: {} (KB)", mem_formatted);
-                        let _ = self._tray_icon.set_tooltip(Some(tooltip));
+                        let _ = self._tray_icon.set_tooltip(Some("Simple Forwarder".to_string()));
                         continue;
                     }
 

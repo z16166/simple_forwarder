@@ -5,6 +5,7 @@ mod logger;
 mod matcher;
 mod proxy_client;
 mod proxy_server;
+mod stats;
 mod tray;
 
 use anyhow::{Context, Result};
@@ -36,8 +37,12 @@ async fn main() -> Result<()> {
 
     let listen_addr = config.get_listen_addr()?;
 
-    let tray_manager = tray::TrayManager::new(rx)?;
-    let server = ProxyServer::new(listen_addr, tx, rules_for_server).await?;
+    let stats = stats::TrafficStats::new();
+    let stats_for_server = stats.clone();
+    let stats_for_tray = stats.clone();
+
+    let tray_manager = tray::TrayManager::new(rx, stats_for_tray)?;
+    let server = ProxyServer::new(listen_addr, tx, rules_for_server, stats_for_server).await?;
 
     // Setup configuration watcher
     let rules_for_watcher = rules_arc.clone();

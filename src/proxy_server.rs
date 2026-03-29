@@ -5,6 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{timeout, Duration};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -13,6 +14,7 @@ const MAX_CONNECTIONS: usize = 1024;
 
 use crate::matcher::RuleMatcher;
 use crate::proxy_client::{ProxyClient, ProxyConfig};
+use crate::stats::TrafficStats;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ pub struct ProxyServer {
     tx: mpsc::Sender<()>,
     rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
     semaphore: Arc<Semaphore>,
+    stats: Arc<TrafficStats>,
 }
 
 impl ProxyServer {
@@ -28,6 +31,7 @@ impl ProxyServer {
         listen_addr: SocketAddr,
         tx: mpsc::Sender<()>,
         rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
+        stats: Arc<TrafficStats>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(listen_addr)
             .await
@@ -38,6 +42,7 @@ impl ProxyServer {
             tx,
             rules,
             semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            stats,
         })
     }
 
@@ -50,6 +55,7 @@ impl ProxyServer {
 
                     let tx = self.tx.clone();
                     let rules = self.rules.clone();
+                    let stats = self.stats.clone();
                     let permit = match self.semaphore.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -61,7 +67,7 @@ impl ProxyServer {
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = handle_connection(stream, peer_addr, rules, tx).await {
+                        if let Err(e) = handle_connection(stream, peer_addr, rules, tx, stats).await {
                             log::error!("Error handling connection from {}: {}", peer_addr, e);
                         }
                     });
@@ -79,6 +85,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
     tx: mpsc::Sender<()>,
+    stats: Arc<TrafficStats>,
 ) -> Result<()> {
     let rules_guard = rules.load();
     let res = timeout(HANDSHAKE_TIMEOUT, async {
@@ -95,8 +102,8 @@ async fn handle_connection(
     }).await;
 
     match res {
-        Ok(Ok((stream, target_stream, host, port))) => {
-            relay_data(stream, target_stream, host, port, peer_addr, tx).await
+        Ok(Ok((stream, target_stream, host, port, is_direct))) => {
+            relay_data(stream, target_stream, host, port, peer_addr, tx, stats, is_direct).await
         }
         Ok(Err(e)) => Err(e),
         Err(_) => {
@@ -111,7 +118,7 @@ async fn handle_socks4(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16)> {
+) -> Result<(TcpStream, TcpStream, String, u16, bool)> {
     // SOCKS4 header: CMD (1), DSTPORT (2), DSTIP (4)
     let mut header = [0u8; 7];
     stream.read_exact(&mut header).await?;
@@ -154,11 +161,11 @@ async fn handle_socks4(
 
     log::info!("SOCKS4{} request from {}: {}:{}", if is_socks4a { "a" } else { "" }, peer_addr, host, port);
 
-    let target_stream = connect_to_target(&host, port, is_socks4a, ip, &rules, &mut stream, false).await?;
+    let (target_stream, is_direct) = connect_to_target(&host, port, is_socks4a, ip, &rules, &mut stream, false).await?;
 
     send_socks4_reply(&mut stream, 0x5A).await?;
 
-    Ok((stream, target_stream, host, port))
+    Ok((stream, target_stream, host, port, is_direct))
 }
 
 async fn send_socks4_reply(stream: &mut TcpStream, status: u8) -> Result<()> {
@@ -174,7 +181,7 @@ async fn handle_socks5(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16)> {
+) -> Result<(TcpStream, TcpStream, String, u16, bool)> {
     // We already read the first byte (version 0x05)
     let mut second_byte = [0u8; 1];
     stream.read_exact(&mut second_byte).await?;
@@ -252,11 +259,11 @@ async fn handle_socks5(
 
     log::info!("SOCKS5 request from {}: {}:{}", peer_addr, host, port);
 
-    let target_stream = connect_to_target(&host, port, resolve_hostname, ip, &rules, &mut stream, true).await?;
+    let (target_stream, is_direct) = connect_to_target(&host, port, resolve_hostname, ip, &rules, &mut stream, true).await?;
 
     send_success_reply(&mut stream).await?;
 
-    Ok((stream, target_stream, host, port))
+    Ok((stream, target_stream, host, port, is_direct))
 }
 
 async fn handle_http(
@@ -264,7 +271,7 @@ async fn handle_http(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16)> {
+) -> Result<(TcpStream, TcpStream, String, u16, bool)> {
     let mut request_line = vec![first_byte];
     let mut byte = [0u8; 1];
     loop {
@@ -318,7 +325,7 @@ async fn handle_http(
 
     log::info!("HTTP {} request from {}: {}:{}", method, peer_addr, host, port);
 
-    let mut target_stream = connect_to_target(&host, port, true, None, &rules, &mut stream, false).await?;
+    let (mut target_stream, is_direct) = connect_to_target(&host, port, true, None, &rules, &mut stream, false).await?;
 
     if is_connect {
         // CONNECT request: read headers until empty line (discard them)
@@ -386,7 +393,7 @@ async fn handle_http(
         target_stream.write_all(&headers).await?;
     }
 
-    Ok((stream, target_stream, host, port))
+    Ok((stream, target_stream, host, port, is_direct))
 }
 
 async fn connect_to_target(
@@ -397,13 +404,13 @@ async fn connect_to_target(
     rules: &[(RuleMatcher, ProxyConfig)],
     client_stream: &mut TcpStream,
     is_socks: bool,
-) -> Result<TcpStream> {
+) -> Result<(TcpStream, bool)> {
     for (matcher, proxy_config) in rules {
         if matcher.matches(host, ip) {
             log::info!("Matched rule, forwarding {} to proxy: {}", host, proxy_config.addr);
             let client = ProxyClient::new(proxy_config.clone());
             match client.connect(host, port, resolve_hostname).await {
-                Ok(s) => return Ok(s),
+                Ok(s) => return Ok((s, false)),
                 Err(e) => {
                     log::error!("Failed to connect to proxy {}: {}", proxy_config.addr, e);
                     if is_socks {
@@ -414,10 +421,10 @@ async fn connect_to_target(
             }
         }
     }
-
+ 
     log::info!("No rule matched, connecting directly to {}:{}", host, port);
     match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-        Ok(Ok(s)) => Ok(s),
+        Ok(Ok(s)) => Ok((s, true)),
         Ok(Err(e)) => {
             log::error!("Failed to connect directly to {}:{}: {}", host, port, e);
             if is_socks {
@@ -442,6 +449,8 @@ async fn relay_data(
     port: u16,
     peer_addr: SocketAddr,
     tx: mpsc::Sender<()>,
+    stats: Arc<TrafficStats>,
+    is_direct: bool,
 ) -> Result<()> {
     let _ = tx.try_send(());
 
@@ -455,6 +464,11 @@ async fn relay_data(
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     target_writer.write_all(&buf[..n]).await?;
+                    if is_direct {
+                        stats.direct_tx.fetch_add(n as u64, Ordering::Relaxed);
+                    } else {
+                        stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
@@ -471,6 +485,11 @@ async fn relay_data(
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     client_writer.write_all(&buf[..n]).await?;
+                    if is_direct {
+                        stats.direct_rx.fetch_add(n as u64, Ordering::Relaxed);
+                    } else {
+                        stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
