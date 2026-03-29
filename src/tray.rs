@@ -279,15 +279,18 @@ impl TrayManager {
                                     let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
                                     let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
 
+                                    let run_time = TrayManager::format_duration(stats.start_time.elapsed());
+
                                     let stats_text = format!(
-                                        "Memory Usage: {} KB (Private Mapping)\n\n\
+                                        "Run Time: {}\n\
+                                         Memory Usage: {} KB (Private Mapping)\n\n\
                                          - Direct Traffic -\n\
                                          Inbound: {}\n\
                                          Outbound: {}\n\n\
                                          - Proxy Traffic -\n\
                                          Inbound: {}\n\
                                          Outbound: {}",
-                                        mem_formatted, direct_in, direct_out, upstream_in, upstream_out
+                                        run_time, mem_formatted, direct_in, direct_out, upstream_in, upstream_out
                                     );
 
                                     unsafe {
@@ -470,6 +473,34 @@ impl TrayManager {
             result.push(b as char);
         }
         result
+    }
+
+    fn format_duration(duration: Duration) -> String {
+        let secs = duration.as_secs();
+        if secs == 0 {
+            return "0 seconds".to_string();
+        }
+
+        let days = secs / 86400;
+        let hours = (secs % 86400) / 3600;
+        let minutes = (secs % 3600) / 60;
+        let seconds = secs % 60;
+
+        let mut parts = Vec::new();
+        if days > 0 {
+            parts.push(format!("{} day{}", days, if days > 1 { "s" } else { "" }));
+        }
+        if hours > 0 {
+            parts.push(format!("{} hour{}", hours, if hours > 1 { "s" } else { "" }));
+        }
+        if minutes > 0 {
+            parts.push(format!("{} minute{}", minutes, if minutes > 1 { "s" } else { "" }));
+        }
+        if seconds > 0 {
+            parts.push(format!("{} second{}", seconds, if seconds > 1 { "s" } else { "" }));
+        }
+
+        parts.join(" ")
     }
 
     #[cfg(windows)]

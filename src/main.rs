@@ -21,6 +21,46 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Err(e) = run_app().await {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONERROR};
+            use windows::core::HSTRING;
+            let _ = MessageBoxW(
+                None,
+                &HSTRING::from(format!("Simple Forwarder failed to start:\n\n{}", e)),
+                &HSTRING::from("Simple Forwarder - Startup Error"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn run_app() -> Result<()> {
+    // Single instance check
+    let _instance = {
+        use single_instance::SingleInstance;
+        let instance = SingleInstance::new("SimpleForwarderSingleInstanceMutex")
+            .with_context(|| "Failed to create single instance lock")?;
+        if !instance.is_single() {
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONWARNING};
+                use windows::core::HSTRING;
+                let _ = MessageBoxW(
+                    None,
+                    &HSTRING::from("Another instance of Simple Forwarder is already running.\n\nPlease check the system tray."),
+                    &HSTRING::from("Simple Forwarder - Already Running"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return Ok(());
+        }
+        instance
+    };
+
     let config_path = Path::new("config.yaml");
     let config = Config::from_file(config_path).await
         .with_context(|| "Failed to load config")?;

@@ -6,6 +6,7 @@ pub struct TrafficStats {
     pub upstream_tx: AtomicU64,
     pub direct_rx: AtomicU64,
     pub direct_tx: AtomicU64,
+    pub start_time: std::time::Instant,
 }
 
 impl TrafficStats {
@@ -15,6 +16,7 @@ impl TrafficStats {
             upstream_tx: AtomicU64::new(0),
             direct_rx: AtomicU64::new(0),
             direct_tx: AtomicU64::new(0),
+            start_time: std::time::Instant::now(),
         })
     }
 
