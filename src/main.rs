@@ -15,7 +15,6 @@ use matcher::RuleMatcher;
 use notify::{RecursiveMode, Watcher};
 use proxy_client::ProxyConfig;
 use proxy_server::ProxyServer;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -61,9 +60,12 @@ async fn run_app() -> Result<()> {
         instance
     };
 
-    let config_path = Path::new("config.yaml");
-    let config = Config::from_file(config_path).await
-        .with_context(|| "Failed to load config")?;
+    let exe_path = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+    let exe_dir = exe_path.parent().with_context(|| "Failed to get executable directory")?;
+    let config_path = exe_dir.join("config.yaml");
+
+    let config = Config::from_file(&config_path).await
+        .with_context(|| format!("Failed to load config from {:?}", config_path))?;
 
     logger::setup_logger(&config.log)?;
 
@@ -98,7 +100,7 @@ async fn run_app() -> Result<()> {
         }
     })?;
 
-    watcher.watch(config_path, RecursiveMode::NonRecursive)?;
+    watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
 
     tokio::spawn(async move {
         // Keep watcher alive
