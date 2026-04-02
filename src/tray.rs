@@ -282,7 +282,8 @@ impl TrayManager {
                                     let run_time = TrayManager::format_duration(stats.start_time.elapsed());
 
                                     let stats_text = format!(
-                                        "Run Time: {}\n\
+                                        "Listen Address: {}\n\
+                                         Run Time: {}\n\
                                          Memory Usage: {} KB (Private Mapping)\n\n\
                                          - Direct Traffic -\n\
                                          Inbound: {}\n\
@@ -290,17 +291,15 @@ impl TrayManager {
                                          - Proxy Traffic -\n\
                                          Inbound: {}\n\
                                          Outbound: {}",
-                                        run_time, mem_formatted, direct_in, direct_out, upstream_in, upstream_out
+                                        stats.listen_addr, run_time, mem_formatted, direct_in, direct_out, upstream_in, upstream_out
                                     );
 
-                                    unsafe {
-                                        MessageBoxW(
-                                            None,
-                                            &HSTRING::from(&stats_text),
-                                            &HSTRING::from("Simple Forwarder Status"),
-                                            MB_OK | MB_ICONINFORMATION,
-                                        );
-                                    }
+                                    MessageBoxW(
+                                        None,
+                                        &HSTRING::from(&stats_text),
+                                        &HSTRING::from("Simple Forwarder Status"),
+                                        MB_OK | MB_ICONINFORMATION,
+                                    );
                                 }
                                 lock.store(false, Ordering::SeqCst);
                             });

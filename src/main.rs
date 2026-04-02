@@ -79,7 +79,7 @@ async fn run_app() -> Result<()> {
 
     let listen_addr = config.get_listen_addr()?;
 
-    let stats = stats::TrafficStats::new();
+    let stats = stats::TrafficStats::new(listen_addr.to_string());
     let stats_for_server = stats.clone();
     let stats_for_tray = stats.clone();
 

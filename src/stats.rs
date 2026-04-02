@@ -2,6 +2,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 pub struct TrafficStats {
+    pub listen_addr: String,
     pub upstream_rx: AtomicU64,
     pub upstream_tx: AtomicU64,
     pub direct_rx: AtomicU64,
@@ -10,8 +11,9 @@ pub struct TrafficStats {
 }
 
 impl TrafficStats {
-    pub fn new() -> Arc<Self> {
+    pub fn new(listen_addr: String) -> Arc<Self> {
         Arc::new(Self {
+            listen_addr,
             upstream_rx: AtomicU64::new(0),
             upstream_tx: AtomicU64::new(0),
             direct_rx: AtomicU64::new(0),
