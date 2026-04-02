@@ -85,7 +85,7 @@ jobs:
           ARCHIVE_NAME="simple_forwarder-${{ matrix.target }}${{ matrix.archive_ext }}"
           cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} .
           cp config.yaml config.yaml.example
-          tar -czvf $archiveName ${{ matrix.binary_name }} README.md config.yaml.example LICENSE
+          tar -czvf $ARCHIVE_NAME ${{ matrix.binary_name }} README.md config.yaml.example LICENSE
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
 
       - name: Upload Release Artifacts
