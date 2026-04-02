@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-release:
+    name: Build & Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: simple_forwarder
+            archive_ext: .tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: simple_forwarder.exe
+            archive_ext: .zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: simple_forwarder
+            archive_ext: .zip
+          - os: macos-latest # compile intel binary from the arm runner
+            target: x86_64-apple-darwin
+            binary_name: simple_forwarder
+            archive_ext: .zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libayatana-appindicator3-dev libgtk-3-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archiveName = "simple_forwarder-${{ matrix.target }}${{ matrix.archive_ext }}"
+          $binarySrc = "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          Copy-Item config.yaml config.yaml.example
+          Compress-Archive -Path $binarySrc, README.md, config.yaml.example, LICENSE -DestinationPath $archiveName
+          echo "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Package Artifacts (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ARCHIVE_NAME="simple_forwarder-${{ matrix.target }}${{ matrix.archive_ext }}"
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} .
+          cp config.yaml config.yaml.example
+          zip $ARCHIVE_NAME ${{ matrix.binary_name }} README.md config.yaml.example LICENSE
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: Package Artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ARCHIVE_NAME="simple_forwarder-${{ matrix.target }}${{ matrix.archive_ext }}"
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} .
+          cp config.yaml config.yaml.example
+          tar -czvf $archiveName ${{ matrix.binary_name }} README.md config.yaml.example LICENSE
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: Upload Release Artifacts
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: ${{ env.ARCHIVE_NAME }}
