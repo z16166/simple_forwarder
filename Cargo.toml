@@ -30,5 +30,6 @@ lto = true
 codegen-units = 1
 strip = true
 
-[build-dependencies]
+
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
