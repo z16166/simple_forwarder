@@ -48,9 +48,19 @@ jobs:
       - name: Install dependencies (Ubuntu)
         if: runner.os == 'Linux'
         run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo dpkg --add-architecture arm64
+            # Noble (24.04) uses ubuntu.sources (DEB822 format), earlier versions use sources.list
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i 's/Architectures: \(.*\)/Architectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+              printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: $(lsb_release -sc) $(lsb_release -sc)-updates $(lsb_release -sc)-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nArchitectures: arm64\n" | sudo tee /etc/apt/sources.list.d/arm64.sources
+            else
+              sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+              echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -sc) main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64.list
+              echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -sc)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+              echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -sc)-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+            fi
+            sudo apt-get update
             sudo apt-get install -y \
               gcc-aarch64-linux-gnu \
               libayatana-appindicator3-dev:arm64 \
@@ -58,6 +68,7 @@ jobs:
               libxdo-dev:arm64 \
               pkg-config
           else
+            sudo apt-get update
             sudo apt-get install -y \
               libayatana-appindicator3-dev \
               libgtk-3-dev \
