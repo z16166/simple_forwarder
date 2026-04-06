@@ -50,9 +50,9 @@ jobs:
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             sudo dpkg --add-architecture arm64
-            # Noble (24.04) uses ubuntu.sources (DEB822 format), earlier versions use sources.list
+            # Noble (24.04) support for DEB822 format (ubuntu.sources)
             if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-              sudo sed -i 's/Architectures: \(.*\)/Architectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+              sudo sed -i 's/^URIs: /Architectures: amd64\nURIs: /' /etc/apt/sources.list.d/ubuntu.sources
               printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: $(lsb_release -sc) $(lsb_release -sc)-updates $(lsb_release -sc)-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nArchitectures: arm64\n" | sudo tee /etc/apt/sources.list.d/arm64.sources
             else
               sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
