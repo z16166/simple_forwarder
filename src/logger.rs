@@ -7,9 +7,14 @@ use crate::config::LogConfig;
 
 #[cfg(windows)]
 fn alloc_console() -> Result<()> {
-    use windows::Win32::System::Console::AllocConsole;
+    use windows::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+
     unsafe {
-        AllocConsole()?;
+        // In debug builds we usually already have a console. Only allocate one
+        // for GUI runs that don't have an attached console yet.
+        if GetConsoleWindow().0.is_null() {
+            AllocConsole()?;
+        }
     }
     Ok(())
 }
@@ -87,7 +92,16 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
         )
     });
 
-    match config.log_type {
+    #[cfg(debug_assertions)]
+    let effective_log_type = match config.log_type {
+        crate::config::LogType::None => crate::config::LogType::Console,
+        ref other => other.clone(),
+    };
+
+    #[cfg(not(debug_assertions))]
+    let effective_log_type = config.log_type.clone();
+
+    match effective_log_type {
         crate::config::LogType::None => {
             // Do nothing, no logger initialized and no console allocated
         }
