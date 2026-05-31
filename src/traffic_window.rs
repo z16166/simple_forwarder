@@ -127,8 +127,48 @@ fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIEr
         }
     });
 
+    #[cfg(windows)]
+    set_window_icon(&window);
+
     window.show();
     event_loop.run_delay(1000);
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn set_window_icon(window: &Window) {
+    use std::ffi::c_void;
+
+    use libui::controls::Control;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadIconW, SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON,
+    };
+
+    let hinstance = match unsafe { GetModuleHandleW(None) } {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    // Resource ID 1 is the main icon embedded by winres
+    let hicon = match unsafe { LoadIconW(hinstance, PCWSTR(1_usize as *const u16)) } {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if hicon.is_invalid() {
+        return;
+    }
+
+    // Get native HWND via libui-ffi, cloning so we don't consume the window
+    let control: Control = window.clone().into();
+    let hwnd_raw = unsafe { libui_ffi::uiControlHandle(control.as_ui_control()) };
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+
+    unsafe {
+        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+    }
 }

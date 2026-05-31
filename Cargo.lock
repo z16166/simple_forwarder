@@ -1692,6 +1692,7 @@ dependencies = [
  "http",
  "ipnet",
  "libui",
+ "libui-ffi",
  "log",
  "notify",
  "serde",
