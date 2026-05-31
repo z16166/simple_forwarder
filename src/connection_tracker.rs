@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const MAX_CONNECTIONS: usize = 5000;
+const CLOSED_RETENTION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ConnectionInfo {
@@ -14,6 +16,7 @@ pub struct ConnectionInfo {
     pub status: String,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    closed_at: Option<Instant>,
 }
 
 pub struct ConnectionTracker {
@@ -46,6 +49,7 @@ impl ConnectionTracker {
             status: String::from("connecting"),
             bytes_sent: 0,
             bytes_received: 0,
+            closed_at: None,
         };
         let mut connections = self.connections.lock().unwrap();
         connections.push(info);
@@ -77,6 +81,7 @@ impl ConnectionTracker {
         let mut connections = self.connections.lock().unwrap();
         if let Some(conn) = Self::find(&mut connections, id) {
             conn.status = String::from("closed");
+            conn.closed_at = Some(Instant::now());
         }
     }
 
@@ -84,6 +89,7 @@ impl ConnectionTracker {
         let mut connections = self.connections.lock().unwrap();
         if let Some(conn) = Self::find(&mut connections, id) {
             conn.status = format!("error: {}", err);
+            conn.closed_at = Some(Instant::now());
         }
     }
 
@@ -102,6 +108,8 @@ impl ConnectionTracker {
     }
 
     pub fn snapshot(&self) -> Vec<ConnectionInfo> {
-        self.connections.lock().unwrap().clone()
+        let mut connections = self.connections.lock().unwrap();
+        connections.retain(|c| c.closed_at.map_or(true, |t| t.elapsed() < CLOSED_RETENTION));
+        connections.clone()
     }
 }
