@@ -75,14 +75,17 @@ impl Config {
             .await
             .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
 
-        let config: Config = serde_yaml::from_str(&content)
-            .with_context(|| "Failed to parse config file")?;
+        let config: Config =
+            serde_yaml::from_str(&content).with_context(|| "Failed to parse config file")?;
 
         Ok(config)
     }
 
     pub fn get_listen_addr(&self) -> Result<SocketAddr> {
-        let addr: IpAddr = self.listen.addr.parse()
+        let addr: IpAddr = self
+            .listen
+            .addr
+            .parse()
             .with_context(|| format!("Invalid listen address: {}", self.listen.addr))?;
         Ok(SocketAddr::new(addr, self.listen.port))
     }

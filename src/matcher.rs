@@ -33,7 +33,9 @@ impl RuleMatcher {
                 }
             }
         }
-        Self { patterns: parsed_patterns }
+        Self {
+            patterns: parsed_patterns,
+        }
     }
 
     fn parse_pattern(pattern: String) -> Option<Pattern> {
@@ -57,9 +59,7 @@ impl RuleMatcher {
 
     fn match_pattern(&self, pattern: &Pattern, host: &str, ip: Option<IpAddr>) -> bool {
         match pattern {
-            Pattern::Domain(matcher) => {
-                matcher.matches(host)
-            }
+            Pattern::Domain(matcher) => matcher.matches(host),
             Pattern::Ip(pattern_ip) => {
                 if let Some(ip) = ip {
                     ip == *pattern_ip
@@ -84,9 +84,7 @@ mod tests {
 
     #[test]
     fn test_domain_wildcard() {
-        let matcher = RuleMatcher::new(vec![
-            "*.google.com".to_string(),
-        ]);
+        let matcher = RuleMatcher::new(vec!["*.google.com".to_string()]);
 
         assert!(matcher.matches("www.google.com", None));
         assert!(matcher.matches("mail.google.com", None));
@@ -97,9 +95,7 @@ mod tests {
     #[test]
     fn test_ip_match() {
         let ip = "192.168.1.1".parse().unwrap();
-        let matcher = RuleMatcher::new(vec![
-            "192.168.1.1".to_string(),
-        ]);
+        let matcher = RuleMatcher::new(vec!["192.168.1.1".to_string()]);
 
         assert!(matcher.matches("example.com", Some(ip)));
         assert!(!matcher.matches("example.com", Some("192.168.1.2".parse().unwrap())));
@@ -107,9 +103,7 @@ mod tests {
 
     #[test]
     fn test_cidr_match() {
-        let matcher = RuleMatcher::new(vec![
-            "192.168.1.0/24".to_string(),
-        ]);
+        let matcher = RuleMatcher::new(vec!["192.168.1.0/24".to_string()]);
 
         assert!(matcher.matches("example.com", Some("192.168.1.1".parse().unwrap())));
         assert!(matcher.matches("example.com", Some("192.168.1.255".parse().unwrap())));
@@ -118,9 +112,7 @@ mod tests {
 
     #[test]
     fn test_ipv6_cidr() {
-        let matcher = RuleMatcher::new(vec![
-            "2001:db8::/32".to_string(),
-        ]);
+        let matcher = RuleMatcher::new(vec!["2001:db8::/32".to_string()]);
 
         assert!(matcher.matches("example.com", Some("2001:db8::1".parse().unwrap())));
         assert!(!matcher.matches("example.com", Some("2001:db9::1".parse().unwrap())));
