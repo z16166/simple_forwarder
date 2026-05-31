@@ -36,7 +36,9 @@ impl TableDataSource for TrafficDataSource {
     }
 
     fn cell(&mut self, column: i32, row: i32) -> TableValue {
-        let conn = &self.connections[row as usize];
+        let Some(conn) = self.connections.get(row as usize) else {
+            return TableValue::String(String::new());
+        };
         match column {
             0 => TableValue::String(conn.source_ip.clone()),
             1 => TableValue::String(conn.outbound_target.clone()),
@@ -53,13 +55,25 @@ impl TableDataSource for TrafficDataSource {
     fn set_cell(&mut self, _column: i32, _row: i32, _value: TableValue) {}
 }
 
-pub fn open_traffic_window(tracker: Arc<ConnectionTracker>, is_open: Arc<AtomicBool>) {
-    if is_open.swap(true, Ordering::SeqCst) {
-        return; // already open
+/// Open (or show) the real-time traffic window.
+///
+/// `want_visible` signals the UI thread whether the window should be shown.
+/// `thread_running` tracks whether the UI thread has already been spawned
+/// (`UI::init()` is single-use per process).
+pub fn open_traffic_window(
+    tracker: Arc<ConnectionTracker>,
+    want_visible: Arc<AtomicBool>,
+    thread_running: Arc<AtomicBool>,
+) {
+    // Tell the existing window to show itself (if already running)
+    want_visible.store(true, Ordering::SeqCst);
+
+    if thread_running.swap(true, Ordering::SeqCst) {
+        return; // UI thread already alive
     }
 
     std::thread::spawn(move || {
-        if let Err(e) = run_traffic_window(tracker, is_open) {
+        if let Err(e) = run_traffic_window(tracker, want_visible) {
             log::error!("Traffic window error: {}", e);
         }
     });
@@ -67,11 +81,8 @@ pub fn open_traffic_window(tracker: Arc<ConnectionTracker>, is_open: Arc<AtomicB
 
 fn run_traffic_window(
     tracker: Arc<ConnectionTracker>,
-    is_open: Arc<AtomicBool>,
+    want_visible: Arc<AtomicBool>,
 ) -> Result<(), libui::UIError> {
-    // Clear guard when this function returns (window closed)
-    let _guard = WindowGuard(is_open);
-
     let ui = UI::init()?;
 
     let initial_snapshot = tracker.snapshot();
@@ -96,6 +107,10 @@ fn run_traffic_window(
     for (i, title) in columns.iter().enumerate() {
         table.append_text_column(title, i as i32, Table::COLUMN_READONLY);
     }
+    table.set_column_width(0, 200); // Source
+    table.set_column_width(1, 260); // Outbound Target
+    table.set_column_width(3, 220); // Proxy
+    table.set_column_width(4, 180); // Start Time
 
     #[cfg(windows)]
     let table_hwnd = {
@@ -108,6 +123,23 @@ fn run_traffic_window(
     window.set_margined(true);
     window.set_child(table);
 
+    #[cfg(windows)]
+    set_window_icon(&window);
+
+    #[cfg(windows)]
+    center_window(&window, 1100, 500);
+
+    // Wrap in Rc<RefCell<>> so both on_closing and on_tick can access the window.
+    let window_rc = Rc::new(RefCell::new(window));
+    let window_for_close = window_rc.clone();
+    let window_for_tick = window_rc.clone();
+    let visible_for_close = want_visible.clone();
+
+    window_for_close.borrow_mut().on_closing(&ui, move |w| {
+        visible_for_close.store(false, Ordering::SeqCst);
+        w.hide();
+    });
+
     let ds = data_source.clone();
     let mdl = model.clone();
     let trk = tracker.clone();
@@ -119,6 +151,14 @@ fn run_traffic_window(
 
     let mut event_loop = ui.event_loop();
     event_loop.on_tick(move || {
+        let mut w = window_for_tick.borrow_mut();
+
+        if !want_visible.load(Ordering::SeqCst) {
+            w.hide();
+            return; // Window hidden — skip update
+        }
+        w.show();
+
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::HWND;
@@ -128,12 +168,12 @@ fn run_traffic_window(
             if unsafe { IsWindow(hwnd) }.as_bool() {
                 let mut rect = windows::Win32::Foundation::RECT::default();
                 if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
-                    let w = rect.right - rect.left;
-                    let h = rect.bottom - rect.top;
+                    let width = rect.right - rect.left;
+                    let height = rect.bottom - rect.top;
                     let is_first = prev_width == 0;
-                    let resizing = !is_first && (w != prev_width || h != prev_height);
-                    prev_width = w;
-                    prev_height = h;
+                    let resizing = !is_first && (width != prev_width || height != prev_height);
+                    prev_width = width;
+                    prev_height = height;
 
                     if resizing {
                         let snapshot = trk.snapshot();
@@ -147,6 +187,8 @@ fn run_traffic_window(
                 }
             }
         }
+
+        drop(w); // Release window borrow before model operations
 
         let snapshot = trk.snapshot();
         let mut ds_mut = ds.borrow_mut();
@@ -212,21 +254,18 @@ fn run_traffic_window(
         }
     });
 
-    #[cfg(windows)]
-    set_window_icon(&window);
-
-    window.show();
+    window_rc.borrow_mut().show();
     event_loop.run_delay(1000);
 
-    Ok(())
-}
-
-/// RAII guard that resets the `is_open` flag when the window closes.
-struct WindowGuard(Arc<AtomicBool>);
-impl Drop for WindowGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+    // run_delay only returns if all windows are destroyed (which we prevent
+    // via on_closing). If it ever does, reset the thread_running flag so a
+    // fresh thread can be spawned.
+    #[cfg(windows)]
+    unsafe {
+        LockWindowUpdate(std::ptr::null_mut());
     }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -276,5 +315,19 @@ fn set_window_icon(window: &Window) {
             WPARAM(ICON_BIG as usize),
             LPARAM(hicon.0 as isize),
         );
+    }
+}
+
+#[cfg(windows)]
+fn center_window(window: &Window, width: i32, height: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SetWindowPos, SM_CXSCREEN, SM_CYSCREEN, SWP_NOSIZE};
+
+    let hwnd = get_control_hwnd(&window.clone().into());
+    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let x = (screen_w - width) / 2;
+    let y = (screen_h - height) / 2;
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE);
     }
 }

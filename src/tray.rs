@@ -45,6 +45,7 @@ pub struct TrayManager {
     stats: Arc<TrafficStats>,
     is_dialog_open: Arc<AtomicBool>,
     is_traffic_open: Arc<AtomicBool>,
+    traffic_thread_running: Arc<AtomicBool>,
     tracker: Arc<ConnectionTracker>,
 }
 
@@ -231,6 +232,7 @@ impl TrayManager {
             stats,
             is_dialog_open: Arc::new(AtomicBool::new(false)),
             is_traffic_open: Arc::new(AtomicBool::new(false)),
+            traffic_thread_running: Arc::new(AtomicBool::new(false)),
             tracker,
         })
     }
@@ -343,8 +345,13 @@ impl TrayManager {
                             });
                         } else if event.id == self.traffic_id {
                             let tracker = self.tracker.clone();
-                            let guard = self.is_traffic_open.clone();
-                            traffic_window::open_traffic_window(tracker, guard);
+                            let want_visible = self.is_traffic_open.clone();
+                            let thread_running = self.traffic_thread_running.clone();
+                            traffic_window::open_traffic_window(
+                                tracker,
+                                want_visible,
+                                thread_running,
+                            );
                         }
                     }
 
