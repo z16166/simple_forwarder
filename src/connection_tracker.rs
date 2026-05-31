@@ -113,3 +113,17 @@ impl ConnectionTracker {
         connections.clone()
     }
 }
+
+// PartialEq for display-relevant fields only (skips id and closed_at).
+impl PartialEq for ConnectionInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_ip == other.source_ip
+            && self.outbound_target == other.outbound_target
+            && self.proxy_protocol == other.proxy_protocol
+            && self.proxy == other.proxy
+            && self.start_time == other.start_time
+            && self.status == other.status
+            && self.bytes_sent == other.bytes_sent
+            && self.bytes_received == other.bytes_received
+    }
+}

@@ -94,6 +94,8 @@ fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIEr
         table.append_text_column(title, i as i32, Table::COLUMN_READONLY);
     }
 
+    let mut table_ctrl = table.clone();
+
     let mut window = Window::new(&ui, "Real-time Traffic", 1100, 500, WindowType::NoMenubar);
     window.set_margined(true);
     window.set_child(table);
@@ -106,15 +108,21 @@ fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIEr
     event_loop.on_tick(move || {
         let snapshot = trk.snapshot();
         let mut ds_mut = ds.borrow_mut();
-        let old_len = ds_mut.connections.len();
+        let old_connections = std::mem::take(&mut ds_mut.connections);
+        let old_len = old_connections.len();
         ds_mut.connections = snapshot;
         let new_len = ds_mut.connections.len();
-        drop(ds_mut);
 
         let model = mdl.borrow();
+
+        #[cfg(windows)]
+        set_redraw(&mut table_ctrl, false);
+
         let min_len = old_len.min(new_len);
         for i in 0..min_len {
-            model.notify_row_changed(i as i32);
+            if old_connections[i] != ds_mut.connections[i] {
+                model.notify_row_changed(i as i32);
+            }
         }
         if new_len > old_len {
             for i in old_len..new_len {
@@ -125,6 +133,9 @@ fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIEr
                 model.notify_row_deleted(i as i32);
             }
         }
+
+        #[cfg(windows)]
+        set_redraw(&mut table_ctrl, true);
     });
 
     #[cfg(windows)]
@@ -170,5 +181,28 @@ fn set_window_icon(window: &Window) {
     unsafe {
         SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
         SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+    }
+}
+
+#[cfg(windows)]
+fn set_redraw(table: &mut Table, enable: bool) {
+    use std::ffi::c_void;
+
+    use libui::controls::Control;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::Graphics::Gdi::InvalidateRect;
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    const WM_SETREDRAW: u32 = 0x000B;
+
+    let control: Control = table.clone().into();
+    let hwnd_raw = unsafe { libui_ffi::uiControlHandle(control.as_ui_control()) };
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+
+    unsafe {
+        SendMessageW(hwnd, WM_SETREDRAW, WPARAM(enable as usize), LPARAM(0));
+        if enable {
+            let _ = InvalidateRect(hwnd, None, true);
+        }
     }
 }
