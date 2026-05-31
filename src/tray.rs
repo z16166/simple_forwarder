@@ -7,7 +7,9 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+use crate::connection_tracker::ConnectionTracker;
 use crate::stats::TrafficStats;
+use crate::traffic_window;
 
 #[cfg(windows)]
 use windows::core::PCWSTR;
@@ -39,12 +41,18 @@ pub struct TrayManager {
     quit_id: tray_icon::menu::MenuId,
     autostart_id: tray_icon::menu::MenuId,
     stats_id: tray_icon::menu::MenuId,
+    traffic_id: tray_icon::menu::MenuId,
     stats: Arc<TrafficStats>,
     is_dialog_open: Arc<AtomicBool>,
+    tracker: Arc<ConnectionTracker>,
 }
 
 impl TrayManager {
-    pub fn new(rx: mpsc::Receiver<()>, stats: Arc<TrafficStats>) -> Result<Self> {
+    pub fn new(
+        rx: mpsc::Receiver<()>,
+        stats: Arc<TrafficStats>,
+        tracker: Arc<ConnectionTracker>,
+    ) -> Result<Self> {
         let is_active = Arc::new(AtomicBool::new(false));
 
         let quit_item = MenuItem::new("Quit", true, None);
@@ -55,6 +63,9 @@ impl TrayManager {
 
         let stats_item = MenuItem::new("Traffic Statistics...", true, None);
         let stats_id = stats_item.id().clone();
+
+        let traffic_item = MenuItem::new("Real-time Traffic", true, None);
+        let traffic_id = traffic_item.id().clone();
 
         #[cfg(windows)]
         {
@@ -68,6 +79,7 @@ impl TrayManager {
         let menu = Menu::new();
         menu.append_items(&[
             &stats_item,
+            &traffic_item,
             &tray_icon::menu::PredefinedMenuItem::separator(),
             &autostart_item,
             &tray_icon::menu::PredefinedMenuItem::separator(),
@@ -105,6 +117,7 @@ impl TrayManager {
         let quit_id_for_loop = quit_id.clone();
         let autostart_id_for_loop = autostart_id.clone();
         let stats_id_for_loop = stats_id.clone();
+        let traffic_id_for_loop = traffic_id.clone();
 
         tokio::spawn(async move {
             let mut last_activity = std::time::Instant::now();
@@ -206,8 +219,10 @@ impl TrayManager {
             quit_id: quit_id_for_loop,
             autostart_id: autostart_id_for_loop,
             stats_id: stats_id_for_loop,
+            traffic_id: traffic_id_for_loop,
             stats,
             is_dialog_open: Arc::new(AtomicBool::new(false)),
+            tracker,
         })
     }
 
@@ -303,6 +318,9 @@ impl TrayManager {
                                 }
                                 lock.store(false, Ordering::SeqCst);
                             });
+                        } else if event.id == self.traffic_id {
+                            let tracker = self.tracker.clone();
+                            traffic_window::open_traffic_window(tracker);
                         }
                     }
 

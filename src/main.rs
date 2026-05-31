@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod connection_tracker;
 mod logger;
 mod matcher;
 mod proxy_client;
 mod proxy_server;
 mod stats;
+mod traffic_window;
 mod tray;
 
 use anyhow::{Context, Result};
@@ -83,8 +85,12 @@ async fn run_app() -> Result<()> {
     let stats_for_server = stats.clone();
     let stats_for_tray = stats.clone();
 
-    let tray_manager = tray::TrayManager::new(rx, stats_for_tray)?;
-    let server = ProxyServer::new(listen_addr, tx, rules_for_server, stats_for_server).await?;
+    let tracker = connection_tracker::ConnectionTracker::new();
+    let tracker_for_server = tracker.clone();
+    let tracker_for_tray = tracker.clone();
+
+    let tray_manager = tray::TrayManager::new(rx, stats_for_tray, tracker_for_tray)?;
+    let server = ProxyServer::new(listen_addr, tx, rules_for_server, stats_for_server, tracker_for_server).await?;
 
     // Setup configuration watcher
     let rules_for_watcher = rules_arc.clone();
