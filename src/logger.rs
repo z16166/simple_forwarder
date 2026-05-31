@@ -51,7 +51,7 @@ impl Write for FlushingWriter {
         }
 
         let n = self.writer.write(buf)?;
-        
+
         // Each log entry results in one or more write calls.
         self.count += 1;
         if self.count >= self.flush_count || self.last_flush.elapsed() >= self.flush_interval {
@@ -68,18 +68,17 @@ impl Write for FlushingWriter {
 }
 
 pub fn setup_logger(config: &LogConfig) -> Result<()> {
-    let env = env_logger::Env::default()
-        .filter_or("RUST_LOG", &config.level);
+    let env = env_logger::Env::default().filter_or("RUST_LOG", &config.level);
 
     let builder = env_logger::Builder::from_env(env);
     let mut builder = builder;
-    
+
     builder.format(|buf, record| {
         use std::io::Write;
         let now = chrono::Local::now();
         let level = record.level();
         let style = buf.default_level_style(level);
-        
+
         writeln!(
             buf,
             "[{} {}{:5}{} {}] {}",
@@ -110,8 +109,9 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
             builder.init();
         }
         crate::config::LogType::File => {
-            let log_file = config.file.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Log file path is required when log_type is file"))?;
+            let log_file = config.file.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Log file path is required when log_type is file")
+            })?;
 
             let file = OpenOptions::new()
                 .create(true)
@@ -125,7 +125,9 @@ pub fn setup_logger(config: &LogConfig) -> Result<()> {
                 Duration::from_secs(config.flush_interval_secs),
             );
 
-            builder.target(env_logger::Target::Pipe(Box::new(flushing_writer))).init();
+            builder
+                .target(env_logger::Target::Pipe(Box::new(flushing_writer)))
+                .init();
         }
     }
 

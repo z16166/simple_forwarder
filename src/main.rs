@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod connection_tracker;
+mod etw_resolver;
 mod logger;
 mod matcher;
 mod proxy_client;
 mod proxy_server;
 mod stats;
+mod traffic_window;
 mod tray;
 
 use anyhow::{Context, Result};
@@ -23,7 +26,7 @@ async fn main() -> Result<()> {
     if let Err(e) = run_app().await {
         #[cfg(windows)]
         unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONERROR};
+            use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
             use windows::core::HSTRING;
             let _ = MessageBoxW(
                 None,
@@ -46,11 +49,13 @@ async fn run_app() -> Result<()> {
         if !instance.is_single() {
             #[cfg(windows)]
             unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONWARNING};
+                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
                 use windows::core::HSTRING;
                 let _ = MessageBoxW(
                     None,
-                    &HSTRING::from("Another instance of Simple Forwarder is already running.\n\nPlease check the system tray."),
+                    &HSTRING::from(
+                        "Another instance of Simple Forwarder is already running.\n\nPlease check the system tray.",
+                    ),
                     &HSTRING::from("Simple Forwarder - Already Running"),
                     MB_OK | MB_ICONWARNING,
                 );
@@ -60,11 +65,15 @@ async fn run_app() -> Result<()> {
         instance
     };
 
-    let exe_path = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
-    let exe_dir = exe_path.parent().with_context(|| "Failed to get executable directory")?;
+    let exe_path =
+        std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+    let exe_dir = exe_path
+        .parent()
+        .with_context(|| "Failed to get executable directory")?;
     let config_path = exe_dir.join("config.yaml");
 
-    let config = Config::from_file(&config_path).await
+    let config = Config::from_file(&config_path)
+        .await
         .with_context(|| format!("Failed to load config from {:?}", config_path))?;
 
     logger::setup_logger(&config.log)?;
@@ -83,8 +92,22 @@ async fn run_app() -> Result<()> {
     let stats_for_server = stats.clone();
     let stats_for_tray = stats.clone();
 
-    let tray_manager = tray::TrayManager::new(rx, stats_for_tray)?;
-    let server = ProxyServer::new(listen_addr, tx, rules_for_server, stats_for_server).await?;
+    let tracker = connection_tracker::ConnectionTracker::new();
+    let tracker_for_server = tracker.clone();
+    let tracker_for_tray = tracker.clone();
+
+    let exe_resolver = etw_resolver::ExeResolver::new(listen_addr.port());
+
+    let tray_manager = tray::TrayManager::new(rx, stats_for_tray, tracker_for_tray)?;
+    let server = ProxyServer::new(
+        listen_addr,
+        tx,
+        rules_for_server,
+        stats_for_server,
+        tracker_for_server,
+        exe_resolver,
+    )
+    .await?;
 
     // Setup configuration watcher
     let rules_for_watcher = rules_arc.clone();
@@ -111,15 +134,13 @@ async fn run_app() -> Result<()> {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             match Config::from_file(&config_path_for_watcher).await {
-                Ok(new_config) => {
-                    match parse_rules(&new_config) {
-                        Ok(new_rules) => {
-                            rules_for_watcher.store(Arc::new(new_rules));
-                            log::info!("Rules reloaded successfully");
-                        }
-                        Err(e) => log::error!("Failed to parse new rules: {}", e),
+                Ok(new_config) => match parse_rules(&new_config) {
+                    Ok(new_rules) => {
+                        rules_for_watcher.store(Arc::new(new_rules));
+                        log::info!("Rules reloaded successfully");
                     }
-                }
+                    Err(e) => log::error!("Failed to parse new rules: {}", e),
+                },
                 Err(e) => log::error!("Failed to reload config: {}", e),
             }
         }

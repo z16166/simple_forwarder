@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-    
+use tokio::time::{Duration, timeout};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,10 +51,16 @@ impl ProxyConfig {
 
         // Validate that rest contains a port
         if !rest.contains(':') {
-            return Err(anyhow::anyhow!("Proxy address must include a port: {}", rest));
+            return Err(anyhow::anyhow!(
+                "Proxy address must include a port: {}",
+                rest
+            ));
         }
 
-        Ok(Self { proxy_type, addr: rest.to_string() })
+        Ok(Self {
+            proxy_type,
+            addr: rest.to_string(),
+        })
     }
 }
 
@@ -67,7 +73,12 @@ impl ProxyClient {
         Self { config }
     }
 
-    pub async fn connect(&self, host: &str, port: u16, resolve_hostname: bool) -> Result<TcpStream> {
+    pub async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        resolve_hostname: bool,
+    ) -> Result<TcpStream> {
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&self.config.addr))
             .await
             .with_context(|| format!("Proxy connection timed out: {}", self.config.addr))?
@@ -80,8 +91,16 @@ impl ProxyClient {
         };
 
         let final_host = if should_resolve && resolve_hostname {
-            match timeout(HANDSHAKE_TIMEOUT, tokio::net::lookup_host(format!("{}:{}", host, port))).await {
-                Ok(Ok(mut addrs)) => addrs.next().map(|a| a.ip().to_string()).unwrap_or_else(|| host.to_string()),
+            match timeout(
+                HANDSHAKE_TIMEOUT,
+                tokio::net::lookup_host(format!("{}:{}", host, port)),
+            )
+            .await
+            {
+                Ok(Ok(mut addrs)) => addrs
+                    .next()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_else(|| host.to_string()),
                 _ => host.to_string(),
             }
         } else {
@@ -90,10 +109,18 @@ impl ProxyClient {
 
         let handshake_result = match self.config.proxy_type {
             ProxyType::Socks5 | ProxyType::Socks5h => {
-                timeout(HANDSHAKE_TIMEOUT, self.socks5_connect(&mut stream, &final_host, port, !should_resolve)).await
+                timeout(
+                    HANDSHAKE_TIMEOUT,
+                    self.socks5_connect(&mut stream, &final_host, port, !should_resolve),
+                )
+                .await
             }
             ProxyType::Http => {
-                timeout(HANDSHAKE_TIMEOUT, self.http_connect(&mut stream, &final_host, port)).await
+                timeout(
+                    HANDSHAKE_TIMEOUT,
+                    self.http_connect(&mut stream, &final_host, port),
+                )
+                .await
             }
         };
 
@@ -128,7 +155,9 @@ impl ProxyClient {
         }
 
         if response[1] != 0x00 {
-            return Err(anyhow::anyhow!("SOCKS5 authentication failed, only 'NO AUTHENTICATION' is supported"));
+            return Err(anyhow::anyhow!(
+                "SOCKS5 authentication failed, only 'NO AUTHENTICATION' is supported"
+            ));
         }
 
         log::debug!("SOCKS5 handshake successful, sending connect request");
@@ -139,24 +168,26 @@ impl ProxyClient {
         request.put_u8(0x00);
 
         let addr_parse = host.parse::<std::net::IpAddr>();
-        
+
         match addr_parse {
-            Ok(addr) => {
-                match addr {
-                    std::net::IpAddr::V4(ipv4) => {
-                        log::debug!("Connecting to {}:{} (IPv4) via proxy", host, port);
-                        request.put_u8(0x01);
-                        request.put_slice(&ipv4.octets());
-                    }
-                    std::net::IpAddr::V6(ipv6) => {
-                        log::debug!("Connecting to {}:{} (IPv6) via proxy", host, port);
-                        request.put_u8(0x04);
-                        request.put_slice(&ipv6.octets());
-                    }
+            Ok(addr) => match addr {
+                std::net::IpAddr::V4(ipv4) => {
+                    log::debug!("Connecting to {}:{} (IPv4) via proxy", host, port);
+                    request.put_u8(0x01);
+                    request.put_slice(&ipv4.octets());
                 }
-            }
+                std::net::IpAddr::V6(ipv6) => {
+                    log::debug!("Connecting to {}:{} (IPv6) via proxy", host, port);
+                    request.put_u8(0x04);
+                    request.put_slice(&ipv6.octets());
+                }
+            },
             Err(_) if is_socks5h => {
-                log::debug!("Connecting to {}:{} (Domain) via proxy (SOCKS5h)", host, port);
+                log::debug!(
+                    "Connecting to {}:{} (Domain) via proxy (SOCKS5h)",
+                    host,
+                    port
+                );
                 request.put_u8(0x03);
                 let host_bytes = host.as_bytes();
                 if host_bytes.len() > 255 {
@@ -166,7 +197,10 @@ impl ProxyClient {
                 request.put_slice(host_bytes);
             }
             Err(_) => {
-                return Err(anyhow::anyhow!("Hostname {} found but upstream proxy requires an IP address (standard SOCKS5) and local resolution failed or was disabled", host));
+                return Err(anyhow::anyhow!(
+                    "Hostname {} found but upstream proxy requires an IP address (standard SOCKS5) and local resolution failed or was disabled",
+                    host
+                ));
             }
         }
 
@@ -178,11 +212,17 @@ impl ProxyClient {
         stream.read_exact(&mut response_header).await?;
 
         if response_header[0] != 0x05 {
-            return Err(anyhow::anyhow!("Invalid SOCKS5 version in connect response"));
+            return Err(anyhow::anyhow!(
+                "Invalid SOCKS5 version in connect response"
+            ));
         }
 
         if response_header[1] != 0x00 {
-            return Err(anyhow::anyhow!("SOCKS5 connect failed with code: {} ({})", response_header[1], get_socks5_error(response_header[1])));
+            return Err(anyhow::anyhow!(
+                "SOCKS5 connect failed with code: {} ({})",
+                response_header[1],
+                get_socks5_error(response_header[1])
+            ));
         }
 
         let atyp = response_header[3];
@@ -211,7 +251,12 @@ impl ProxyClient {
     }
 
     async fn http_connect(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<()> {
-        log::debug!("HTTP CONNECT to {}:{} via proxy {}", host, port, self.config.addr);
+        log::debug!(
+            "HTTP CONNECT to {}:{} via proxy {}",
+            host,
+            port,
+            self.config.addr
+        );
         let connect_request = format!(
             "CONNECT {}:{} HTTP/1.1\r\n\
              Host: {}:{}\r\n\
@@ -223,15 +268,15 @@ impl ProxyClient {
 
         let mut response = Vec::new();
         let mut byte = [0u8; 1];
-        
+
         loop {
             stream.read_exact(&mut byte).await?;
             response.push(byte[0]);
-            
+
             if response.ends_with(b"\r\n\r\n") {
                 break;
             }
-            
+
             if response.len() > 8192 {
                 return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
             }
@@ -242,7 +287,10 @@ impl ProxyClient {
         if status_line.contains(" 200") {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("HTTP CONNECT failed: {}", status_line.trim()))
+            Err(anyhow::anyhow!(
+                "HTTP CONNECT failed: {}",
+                status_line.trim()
+            ))
         }
     }
 }
