@@ -2,6 +2,7 @@
 
 mod config;
 mod connection_tracker;
+mod etw_resolver;
 mod logger;
 mod matcher;
 mod proxy_client;
@@ -95,6 +96,8 @@ async fn run_app() -> Result<()> {
     let tracker_for_server = tracker.clone();
     let tracker_for_tray = tracker.clone();
 
+    let exe_resolver = etw_resolver::ExeResolver::new(listen_addr.port());
+
     let tray_manager = tray::TrayManager::new(rx, stats_for_tray, tracker_for_tray)?;
     let server = ProxyServer::new(
         listen_addr,
@@ -102,6 +105,7 @@ async fn run_app() -> Result<()> {
         rules_for_server,
         stats_for_server,
         tracker_for_server,
+        exe_resolver,
     )
     .await?;
 

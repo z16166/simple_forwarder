@@ -13,6 +13,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONNECTIONS: usize = 1024;
 
 use crate::connection_tracker::ConnectionTracker;
+use crate::etw_resolver::ExeResolver;
 use crate::matcher::RuleMatcher;
 use crate::proxy_client::{ProxyClient, ProxyConfig, ProxyType};
 use crate::stats::TrafficStats;
@@ -26,6 +27,7 @@ pub struct ProxyServer {
     semaphore: Arc<Semaphore>,
     stats: Arc<TrafficStats>,
     tracker: Arc<ConnectionTracker>,
+    exe_resolver: ExeResolver,
 }
 
 impl ProxyServer {
@@ -35,6 +37,7 @@ impl ProxyServer {
         rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
         stats: Arc<TrafficStats>,
         tracker: Arc<ConnectionTracker>,
+        exe_resolver: ExeResolver,
     ) -> Result<Self> {
         let listener = TcpListener::bind(listen_addr)
             .await
@@ -47,6 +50,7 @@ impl ProxyServer {
             semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             stats,
             tracker,
+            exe_resolver,
         })
     }
 
@@ -61,6 +65,7 @@ impl ProxyServer {
                     let rules = self.rules.clone();
                     let stats = self.stats.clone();
                     let tracker = self.tracker.clone();
+                    let exe_resolver = self.exe_resolver.clone();
                     let permit = match self.semaphore.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -76,8 +81,16 @@ impl ProxyServer {
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) =
-                            handle_connection(stream, peer_addr, rules, tx, stats, tracker).await
+                        if let Err(e) = handle_connection(
+                            stream,
+                            peer_addr,
+                            rules,
+                            tx,
+                            stats,
+                            tracker,
+                            exe_resolver,
+                        )
+                        .await
                         {
                             log::error!("Error handling connection from {}: {}", peer_addr, e);
                         }
@@ -98,6 +111,7 @@ async fn handle_connection(
     tx: mpsc::Sender<()>,
     stats: Arc<TrafficStats>,
     tracker: Arc<ConnectionTracker>,
+    exe_resolver: ExeResolver,
 ) -> Result<()> {
     // Register at accept time so failed handshakes appear in the table.
     let conn_id = tracker.register(
@@ -105,6 +119,43 @@ async fn handle_connection(
         String::from("resolving..."),
         String::from("detecting..."),
     );
+
+    // Resolve exe name in background — lookup uses spawn_blocking internally
+    // to avoid starving the Tokio worker pool with blocking OS calls.
+    let exe_for_lookup = exe_resolver.clone();
+    let exe_tracker = tracker.clone();
+    let conn_peer = peer_addr;
+    tokio::spawn(async move {
+        let sport = conn_peer.port();
+        log::debug!("exe lookup: conn_id={}, sport={}", conn_id, sport);
+        if let Some(exe) = exe_for_lookup.lookup(sport).await {
+            log::debug!(
+                "exe lookup: conn_id={}, sport={}, exe={}",
+                conn_id,
+                sport,
+                exe
+            );
+            exe_tracker.set_exe_name(conn_id, exe);
+            return;
+        }
+        // Quick retry: ETW event may arrive between the first lookup and now.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Some(exe) = exe_for_lookup.lookup(sport).await {
+            log::debug!(
+                "exe lookup (retry): conn_id={}, sport={}, exe={}",
+                conn_id,
+                sport,
+                exe
+            );
+            exe_tracker.set_exe_name(conn_id, exe);
+        } else {
+            log::debug!(
+                "exe lookup: conn_id={}, sport={}, not found",
+                conn_id,
+                sport
+            );
+        }
+    });
 
     let rules_guard = rules.load();
     let res = timeout(HANDSHAKE_TIMEOUT, async {
@@ -132,7 +183,7 @@ async fn handle_connection(
             tracker.set_proxy(conn_id, proxy_desc.clone());
             tracker.set_connected(conn_id);
 
-            relay_data(
+            let result = relay_data(
                 stream,
                 target_stream,
                 host,
@@ -144,15 +195,19 @@ async fn handle_connection(
                 conn_id,
                 tracker,
             )
-            .await
+            .await;
+            exe_resolver.remove(peer_addr.port());
+            result
         }
         Ok(Err(e)) => {
             tracker.set_error(conn_id, &e.to_string());
+            exe_resolver.remove(peer_addr.port());
             Err(e)
         }
         Err(_) => {
             log::warn!("Handshake with {} timed out", peer_addr);
             tracker.set_error(conn_id, "Handshake timed out");
+            exe_resolver.remove(peer_addr.port());
             Err(anyhow::anyhow!("Handshake timed out"))
         }
     }

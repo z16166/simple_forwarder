@@ -24,7 +24,7 @@ struct TrafficDataSource {
 
 impl TableDataSource for TrafficDataSource {
     fn num_columns(&mut self) -> i32 {
-        8
+        9
     }
 
     fn num_rows(&mut self) -> i32 {
@@ -42,12 +42,13 @@ impl TableDataSource for TrafficDataSource {
         match column {
             0 => TableValue::String(conn.source_ip.clone()),
             1 => TableValue::String(conn.outbound_target.clone()),
-            2 => TableValue::String(conn.proxy_protocol.clone()),
-            3 => TableValue::String(conn.proxy.clone()),
-            4 => TableValue::String(conn.start_time.clone()),
-            5 => TableValue::String(conn.status.clone()),
-            6 => TableValue::String(TrafficStats::format_bytes(conn.bytes_sent)),
-            7 => TableValue::String(TrafficStats::format_bytes(conn.bytes_received)),
+            2 => TableValue::String(conn.exe_name.clone()),
+            3 => TableValue::String(conn.proxy_protocol.clone()),
+            4 => TableValue::String(conn.proxy.clone()),
+            5 => TableValue::String(conn.start_time.clone()),
+            6 => TableValue::String(conn.status.clone()),
+            7 => TableValue::String(TrafficStats::format_bytes(conn.bytes_sent)),
+            8 => TableValue::String(TrafficStats::format_bytes(conn.bytes_received)),
             _ => TableValue::String(String::new()),
         }
     }
@@ -97,6 +98,7 @@ fn run_traffic_window(
     let columns = [
         "Source",
         "Outbound Target",
+        "Exe",
         "Proxy Protocol",
         "Proxy",
         "Start Time",
@@ -109,8 +111,9 @@ fn run_traffic_window(
     }
     table.set_column_width(0, 200); // Source
     table.set_column_width(1, 260); // Outbound Target
-    table.set_column_width(3, 220); // Proxy
-    table.set_column_width(4, 180); // Start Time
+    table.set_column_width(2, 160); // Exe
+    table.set_column_width(4, 220); // Proxy
+    table.set_column_width(5, 180); // Start Time
 
     #[cfg(windows)]
     let table_hwnd = {
@@ -320,7 +323,9 @@ fn set_window_icon(window: &Window) {
 
 #[cfg(windows)]
 fn center_window(window: &Window, width: i32, height: i32) {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SetWindowPos, SM_CXSCREEN, SM_CYSCREEN, SWP_NOSIZE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SWP_NOSIZE, SetWindowPos,
+    };
 
     let hwnd = get_control_hwnd(&window.clone().into());
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };

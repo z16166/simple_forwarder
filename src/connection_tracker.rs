@@ -16,6 +16,7 @@ pub struct ConnectionInfo {
     pub status: String,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub exe_name: String,
     closed_at: Option<Instant>,
 }
 
@@ -49,6 +50,7 @@ impl ConnectionTracker {
             status: String::from("connecting"),
             bytes_sent: 0,
             bytes_received: 0,
+            exe_name: String::new(),
             closed_at: None,
         };
         let mut connections = self.connections.lock().unwrap();
@@ -67,6 +69,13 @@ impl ConnectionTracker {
 
     fn find(connections: &mut [ConnectionInfo], id: u64) -> Option<&mut ConnectionInfo> {
         connections.iter_mut().find(|c| c.id == id)
+    }
+
+    pub fn set_exe_name(&self, id: u64, exe_name: String) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(conn) = Self::find(&mut connections, id) {
+            conn.exe_name = exe_name;
+        }
     }
 
     pub fn set_proxy(&self, id: u64, proxy: String) {
@@ -145,5 +154,6 @@ impl PartialEq for ConnectionInfo {
             && self.status == other.status
             && self.bytes_sent == other.bytes_sent
             && self.bytes_received == other.bytes_received
+            && self.exe_name == other.exe_name
     }
 }
