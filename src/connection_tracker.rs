@@ -54,7 +54,13 @@ impl ConnectionTracker {
         let mut connections = self.connections.lock().unwrap();
         connections.push(info);
         if connections.len() > MAX_CONNECTIONS {
-            connections.remove(0);
+            let evicted = connections.remove(0);
+            log::warn!(
+                "Connection tracker full ({}), evicted oldest connection id={} addr={}",
+                MAX_CONNECTIONS,
+                evicted.id,
+                evicted.source_ip,
+            );
         }
         id
     }
@@ -67,6 +73,20 @@ impl ConnectionTracker {
         let mut connections = self.connections.lock().unwrap();
         if let Some(conn) = Self::find(&mut connections, id) {
             conn.proxy = proxy;
+        }
+    }
+
+    pub fn set_outbound_target(&self, id: u64, target: String) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(conn) = Self::find(&mut connections, id) {
+            conn.outbound_target = target;
+        }
+    }
+
+    pub fn set_proxy_protocol(&self, id: u64, protocol: String) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(conn) = Self::find(&mut connections, id) {
+            conn.proxy_protocol = protocol;
         }
     }
 

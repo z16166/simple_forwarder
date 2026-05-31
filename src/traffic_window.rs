@@ -1,33 +1,21 @@
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use libui::UI;
 use libui::controls::{
     Table, TableDataSource, TableModel, TableParameters, TableValue, TableValueType, Window,
     WindowType,
 };
-use libui::UI;
 
 use crate::connection_tracker::ConnectionTracker;
+use crate::stats::TrafficStats;
 
 #[cfg(windows)]
 unsafe extern "system" {
     fn LockWindowUpdate(hWndLock: *mut std::ffi::c_void);
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 struct TrafficDataSource {
@@ -56,8 +44,8 @@ impl TableDataSource for TrafficDataSource {
             3 => TableValue::String(conn.proxy.clone()),
             4 => TableValue::String(conn.start_time.clone()),
             5 => TableValue::String(conn.status.clone()),
-            6 => TableValue::String(format_bytes(conn.bytes_sent)),
-            7 => TableValue::String(format_bytes(conn.bytes_received)),
+            6 => TableValue::String(TrafficStats::format_bytes(conn.bytes_sent)),
+            7 => TableValue::String(TrafficStats::format_bytes(conn.bytes_received)),
             _ => TableValue::String(String::new()),
         }
     }
@@ -65,15 +53,25 @@ impl TableDataSource for TrafficDataSource {
     fn set_cell(&mut self, _column: i32, _row: i32, _value: TableValue) {}
 }
 
-pub fn open_traffic_window(tracker: Arc<ConnectionTracker>) {
+pub fn open_traffic_window(tracker: Arc<ConnectionTracker>, is_open: Arc<AtomicBool>) {
+    if is_open.swap(true, Ordering::SeqCst) {
+        return; // already open
+    }
+
     std::thread::spawn(move || {
-        if let Err(e) = run_traffic_window(tracker) {
+        if let Err(e) = run_traffic_window(tracker, is_open) {
             log::error!("Traffic window error: {}", e);
         }
     });
 }
 
-fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIError> {
+fn run_traffic_window(
+    tracker: Arc<ConnectionTracker>,
+    is_open: Arc<AtomicBool>,
+) -> Result<(), libui::UIError> {
+    // Clear guard when this function returns (window closed)
+    let _guard = WindowGuard(is_open);
+
     let ui = UI::init()?;
 
     let initial_snapshot = tracker.snapshot();
@@ -124,55 +122,94 @@ fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIEr
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-            let mut rect = windows::Win32::Foundation::RECT::default();
-            if unsafe { GetWindowRect(HWND(table_hwnd), &mut rect) }.is_ok() {
-                let w = rect.right - rect.left;
-                let h = rect.bottom - rect.top;
-                let is_first = prev_width == 0;
-                let resizing = !is_first && (w != prev_width || h != prev_height);
-                prev_width = w;
-                prev_height = h;
+            use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindow};
 
-                if resizing {
-                    // Silently swap data during window resize — don't lock
-                    // or notify, let the resize animation paint freely.
-                    let snapshot = trk.snapshot();
-                    ds.borrow_mut().connections = snapshot;
-                    return;
+            let hwnd = HWND(table_hwnd);
+            if unsafe { IsWindow(hwnd) }.as_bool() {
+                let mut rect = windows::Win32::Foundation::RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
+                    let w = rect.right - rect.left;
+                    let h = rect.bottom - rect.top;
+                    let is_first = prev_width == 0;
+                    let resizing = !is_first && (w != prev_width || h != prev_height);
+                    prev_width = w;
+                    prev_height = h;
+
+                    if resizing {
+                        let snapshot = trk.snapshot();
+                        ds.borrow_mut().connections = snapshot;
+                        return;
+                    }
+                }
+
+                unsafe {
+                    LockWindowUpdate(table_hwnd);
                 }
             }
-
-            unsafe { LockWindowUpdate(table_hwnd); }
         }
 
         let snapshot = trk.snapshot();
         let mut ds_mut = ds.borrow_mut();
         let old_connections = std::mem::take(&mut ds_mut.connections);
-        let old_len = old_connections.len();
         ds_mut.connections = snapshot;
-        let new_len = ds_mut.connections.len();
 
         let model = mdl.borrow();
 
-        let min_len = old_len.min(new_len);
-        for i in 0..min_len {
-            if old_connections[i] != ds_mut.connections[i] {
-                model.notify_row_changed(i as i32);
+        // ID-based diff: match rows by connection id so that mid-vector
+        // removals (pruning, eviction) don't cause index misalignment.
+        //
+        // Index-space model (3 steps, executed in order):
+        //
+        //   Step 1 — deletions use OLD snapshot indices. Notifying high-to-low
+        //   ensures each deletion doesn't shift indices of the remaining
+        //   not-yet-deleted rows.
+        //
+        //   After step 1, the model has the same set of rows (and same order)
+        //   as the new data source. The surviving rows are at identical
+        //   positions in both the post-deletion model and the data source.
+        //
+        //   Step 2 — changed rows use NEW data-source indices, which now
+        //   match the model's post-deletion state.
+        //
+        //   Step 3 — insertions also use NEW data-source indices. Inserting
+        //   low-to-high is correct because step 1 already removed all stale
+        //   rows; the model's row count is exactly new_len - insert_count.
+        let old_idx_by_id: HashMap<u64, usize> = old_connections
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id, i))
+            .collect();
+        let new_ids: HashSet<u64> = ds_mut.connections.iter().map(|c| c.id).collect();
+
+        // 1. Delete rows no longer in the new snapshot (old indices, high→low)
+        let mut del_indices: Vec<usize> = (0..old_connections.len())
+            .filter(|i| !new_ids.contains(&old_connections[*i].id))
+            .collect();
+        del_indices.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in &del_indices {
+            model.notify_row_deleted(*idx as i32);
+        }
+
+        // 2. Notify changed rows (new indices — model now == data source)
+        for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
+            if let Some(&old_idx) = old_idx_by_id.get(&conn.id) {
+                if old_connections[old_idx] != *conn {
+                    model.notify_row_changed(new_idx as i32);
+                }
             }
         }
-        if new_len > old_len {
-            for i in old_len..new_len {
-                model.notify_row_inserted(i as i32);
-            }
-        } else if old_len > new_len {
-            for i in (new_len..old_len).rev() {
-                model.notify_row_deleted(i as i32);
+
+        // 3. Insert genuinely new rows (new indices, low→high)
+        for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
+            if !old_idx_by_id.contains_key(&conn.id) {
+                model.notify_row_inserted(new_idx as i32);
             }
         }
 
         #[cfg(windows)]
-        unsafe { LockWindowUpdate(std::ptr::null_mut()); }
+        unsafe {
+            LockWindowUpdate(std::ptr::null_mut());
+        }
     });
 
     #[cfg(windows)]
@@ -182,6 +219,14 @@ fn run_traffic_window(tracker: Arc<ConnectionTracker>) -> Result<(), libui::UIEr
     event_loop.run_delay(1000);
 
     Ok(())
+}
+
+/// RAII guard that resets the `is_open` flag when the window closes.
+struct WindowGuard(Arc<AtomicBool>);
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(windows)]
@@ -195,12 +240,12 @@ fn get_control_hwnd(control: &libui::controls::Control) -> windows::Win32::Found
 
 #[cfg(windows)]
 fn set_window_icon(window: &Window) {
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        LoadIconW, SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON,
+        ICON_BIG, ICON_SMALL, LoadIconW, SendMessageW, WM_SETICON,
     };
+    use windows::core::PCWSTR;
 
     let hinstance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => h,
@@ -219,7 +264,17 @@ fn set_window_icon(window: &Window) {
     let hwnd = get_control_hwnd(&window.clone().into());
 
     unsafe {
-        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
-        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_SMALL as usize),
+            LPARAM(hicon.0 as isize),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_BIG as usize),
+            LPARAM(hicon.0 as isize),
+        );
     }
 }

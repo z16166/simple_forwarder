@@ -1,25 +1,25 @@
-use anyhow::Result;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
-    TrayIcon, TrayIconBuilder, TrayIconEvent,
-};
 use crate::connection_tracker::ConnectionTracker;
 use crate::stats::TrafficStats;
 use crate::traffic_window;
+use anyhow::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tray_icon::{
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
+};
 
 #[cfg(windows)]
-use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
 #[cfg(windows)]
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY_CURRENT_USER,
-    KEY_ALL_ACCESS, REG_SZ,
+    HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 #[cfg(windows)]
-use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+use windows::core::PCWSTR;
 
 #[cfg(windows)]
 const RUN_REGISTRY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
@@ -44,6 +44,7 @@ pub struct TrayManager {
     traffic_id: tray_icon::menu::MenuId,
     stats: Arc<TrafficStats>,
     is_dialog_open: Arc<AtomicBool>,
+    is_traffic_open: Arc<AtomicBool>,
     tracker: Arc<ConnectionTracker>,
 }
 
@@ -190,9 +191,16 @@ impl TrayManager {
                                 let tid = tid_for_events.load(Ordering::Acquire);
                                 if tid != 0 {
                                     unsafe {
-                                        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                        use windows::Win32::Foundation::{WPARAM, LPARAM};
-                                        let _ = PostThreadMessageW(tid, WM_USER + 3, WPARAM(0), LPARAM(0));
+                                        use windows::Win32::Foundation::{LPARAM, WPARAM};
+                                        use windows::Win32::UI::WindowsAndMessaging::{
+                                            PostThreadMessageW, WM_USER,
+                                        };
+                                        let _ = PostThreadMessageW(
+                                            tid,
+                                            WM_USER + 3,
+                                            WPARAM(0),
+                                            LPARAM(0),
+                                        );
                                     }
                                 }
                             }
@@ -222,6 +230,7 @@ impl TrayManager {
             traffic_id: traffic_id_for_loop,
             stats,
             is_dialog_open: Arc::new(AtomicBool::new(false)),
+            is_traffic_open: Arc::new(AtomicBool::new(false)),
             tracker,
         })
     }
@@ -229,13 +238,12 @@ impl TrayManager {
     pub fn run_message_loop(&self) {
         #[cfg(windows)]
         {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_USER,
-                WM_SETICON, ICON_SMALL, ICON_BIG, DestroyIcon,
-                MessageBoxW, MB_OK, MB_ICONINFORMATION,
-            };
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
             use windows::Win32::System::Console::GetConsoleWindow;
-            use windows::Win32::Foundation::{WPARAM, LPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DestroyIcon, DispatchMessageW, GetMessageW, ICON_BIG, ICON_SMALL,
+                MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, TranslateMessage, WM_SETICON, WM_USER,
+            };
             use windows::core::HSTRING;
 
             unsafe {
@@ -289,12 +297,21 @@ impl TrayManager {
                                     let mem_kb = TrayManager::get_current_memory_usage_kb();
                                     let mem_formatted = TrayManager::format_with_commas(mem_kb);
 
-                                    let direct_in = TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
-                                    let direct_out = TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
-                                    let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
-                                    let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
+                                    let direct_in = TrafficStats::format_bytes(
+                                        stats.direct_rx.load(Ordering::Relaxed),
+                                    );
+                                    let direct_out = TrafficStats::format_bytes(
+                                        stats.direct_tx.load(Ordering::Relaxed),
+                                    );
+                                    let upstream_in = TrafficStats::format_bytes(
+                                        stats.upstream_rx.load(Ordering::Relaxed),
+                                    );
+                                    let upstream_out = TrafficStats::format_bytes(
+                                        stats.upstream_tx.load(Ordering::Relaxed),
+                                    );
 
-                                    let run_time = TrayManager::format_duration(stats.start_time.elapsed());
+                                    let run_time =
+                                        TrayManager::format_duration(stats.start_time.elapsed());
 
                                     let stats_text = format!(
                                         "Listen Address: {}\n\
@@ -306,7 +323,13 @@ impl TrayManager {
                                          - Proxy Traffic -\n\
                                          Inbound: {}\n\
                                          Outbound: {}",
-                                        stats.listen_addr, run_time, mem_formatted, direct_in, direct_out, upstream_in, upstream_out
+                                        stats.listen_addr,
+                                        run_time,
+                                        mem_formatted,
+                                        direct_in,
+                                        direct_out,
+                                        upstream_in,
+                                        upstream_out
                                     );
 
                                     MessageBoxW(
@@ -320,7 +343,8 @@ impl TrayManager {
                             });
                         } else if event.id == self.traffic_id {
                             let tracker = self.tracker.clone();
-                            traffic_window::open_traffic_window(tracker);
+                            let guard = self.is_traffic_open.clone();
+                            traffic_window::open_traffic_window(tracker, guard);
                         }
                     }
 
@@ -332,7 +356,9 @@ impl TrayManager {
 
                     // WM_USER+3: tooltip update request (hover/move)
                     if msg.message == WM_USER + 3 {
-                        let _ = self._tray_icon.set_tooltip(Some("Simple Forwarder".to_string()));
+                        let _ = self
+                            ._tray_icon
+                            .set_tooltip(Some("Simple Forwarder".to_string()));
                         continue;
                     }
 
@@ -341,7 +367,11 @@ impl TrayManager {
                         log::debug!("Received UI update message: active={}", active);
 
                         // Update Tray Icon using cached icons
-                        let icon = if active { &self.icon_active } else { &self.icon_inactive };
+                        let icon = if active {
+                            &self.icon_active
+                        } else {
+                            &self.icon_inactive
+                        };
                         if let Err(e) = self._tray_icon.set_icon(Some(icon.clone())) {
                             log::error!("Failed to set tray icon: {}", e);
                         }
@@ -353,21 +383,41 @@ impl TrayManager {
 
                         // Update Taskbar Icon (if console exists) using cached hicons
                         if !hwnd_console.0.is_null() {
-                            let hicon = if active { self.hicon_active } else { self.hicon_inactive };
-                            use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM};
+                            let hicon = if active {
+                                self.hicon_active
+                            } else {
+                                self.hicon_inactive
+                            };
+                            use windows::Win32::UI::WindowsAndMessaging::{
+                                GCLP_HICON, GCLP_HICONSM, SendMessageW, SetClassLongPtrW,
+                            };
 
                             // Try both SendMessage and SetClassLongPtr for maximum compatibility
-                            let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
-                            let _ = SendMessageW(hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
-                            
+                            let _ = SendMessageW(
+                                hwnd_console,
+                                WM_SETICON,
+                                WPARAM(ICON_SMALL as usize),
+                                LPARAM(hicon.0 as isize),
+                            );
+                            let _ = SendMessageW(
+                                hwnd_console,
+                                WM_SETICON,
+                                WPARAM(ICON_BIG as usize),
+                                LPARAM(hicon.0 as isize),
+                            );
+
                             #[cfg(target_pointer_width = "64")]
                             {
-                                let _ = SetClassLongPtrW(hwnd_console, GCLP_HICON, hicon.0 as isize);
-                                let _ = SetClassLongPtrW(hwnd_console, GCLP_HICONSM, hicon.0 as isize);
+                                let _ =
+                                    SetClassLongPtrW(hwnd_console, GCLP_HICON, hicon.0 as isize);
+                                let _ =
+                                    SetClassLongPtrW(hwnd_console, GCLP_HICONSM, hicon.0 as isize);
                             }
                             #[cfg(target_pointer_width = "32")]
                             {
-                                use windows::Win32::UI::WindowsAndMessaging::{SetClassLongW, GCL_HICON, GCL_HICONSM};
+                                use windows::Win32::UI::WindowsAndMessaging::{
+                                    GCL_HICON, GCL_HICONSM, SetClassLongW,
+                                };
                                 let _ = SetClassLongW(hwnd_console, GCL_HICON, hicon.0 as i32);
                                 let _ = SetClassLongW(hwnd_console, GCL_HICONSM, hicon.0 as i32);
                             }
@@ -377,7 +427,7 @@ impl TrayManager {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-                
+
                 // Final cleanup of cached handles
                 let _ = DestroyIcon(self.hicon_active);
                 let _ = DestroyIcon(self.hicon_inactive);
@@ -392,7 +442,11 @@ impl TrayManager {
     }
 
     #[cfg(windows)]
-    fn create_hicon_from_rgba(rgba: &[u8], width: i32, height: i32) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    fn create_hicon_from_rgba(
+        rgba: &[u8],
+        width: i32,
+        height: i32,
+    ) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
         use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
         use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
 
@@ -400,17 +454,18 @@ impl TrayManager {
             // Convert RGBA to BGRA
             let mut bgra = vec![0u8; rgba.len()];
             for i in (0..rgba.len()).step_by(4) {
-                bgra[i] = rgba[i + 2];     // B
+                bgra[i] = rgba[i + 2]; // B
                 bgra[i + 1] = rgba[i + 1]; // G
-                bgra[i + 2] = rgba[i];     // R
+                bgra[i + 2] = rgba[i]; // R
                 bgra[i + 3] = rgba[i + 3]; // A
             }
 
             let h_bm_color = CreateBitmap(width, height, 1, 32, Some(bgra.as_ptr() as *const _));
-            
+
             // Create a monochrome AND mask (all black = opaque)
             let mask_bytes = vec![0u8; (width * height / 8) as usize];
-            let h_bm_mask = CreateBitmap(width, height, 1, 1, Some(mask_bytes.as_ptr() as *const _));
+            let h_bm_mask =
+                CreateBitmap(width, height, 1, 1, Some(mask_bytes.as_ptr() as *const _));
 
             let icon_info = ICONINFO {
                 fIcon: true.into(),
@@ -431,11 +486,7 @@ impl TrayManager {
 
     fn create_simple_icon(active: bool) -> Result<Vec<u8>> {
         let mut rgba = vec![0u8; 32 * 32 * 4];
-        let color = if active {
-            (0, 255, 0)
-        } else {
-            (100, 100, 100)
-        };
+        let color = if active { (0, 255, 0) } else { (100, 100, 100) };
 
         for y in 0..32 {
             for x in 0..32 {
@@ -456,17 +507,21 @@ impl TrayManager {
 
     #[cfg(windows)]
     fn get_current_memory_usage_kb() -> usize {
-        use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
         use windows::Win32::System::Threading::GetCurrentProcess;
-        
+
         let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
         unsafe {
             let handle = GetCurrentProcess();
             if GetProcessMemoryInfo(
                 handle,
                 &mut counters as *mut _ as *mut _,
-                std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32
-            ).is_ok() {
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            )
+            .is_ok()
+            {
                 return counters.PrivateUsage / 1024;
             }
         }
@@ -508,13 +563,25 @@ impl TrayManager {
             parts.push(format!("{} day{}", days, if days > 1 { "s" } else { "" }));
         }
         if hours > 0 {
-            parts.push(format!("{} hour{}", hours, if hours > 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{} hour{}",
+                hours,
+                if hours > 1 { "s" } else { "" }
+            ));
         }
         if minutes > 0 {
-            parts.push(format!("{} minute{}", minutes, if minutes > 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{} minute{}",
+                minutes,
+                if minutes > 1 { "s" } else { "" }
+            ));
         }
         if seconds > 0 {
-            parts.push(format!("{} second{}", seconds, if seconds > 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{} second{}",
+                seconds,
+                if seconds > 1 { "s" } else { "" }
+            ));
         }
 
         parts.join(" ")
@@ -524,12 +591,12 @@ impl TrayManager {
     fn get_quoted_exe_path() -> Result<String> {
         let path = std::env::current_exe()?;
         let path_str = path.to_string_lossy().to_string();
-        
+
         // Convert to long path name to ensure registry consistency
         let wide_path: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
         let mut buffer = [0u16; 1024];
         let len = unsafe { GetLongPathNameW(PCWSTR(wide_path.as_ptr()), Some(&mut buffer)) };
-        
+
         let final_path = if len > 0 && (len as usize) < buffer.len() {
             String::from_utf16_lossy(&buffer[..len as usize])
         } else {
@@ -543,12 +610,17 @@ impl TrayManager {
     fn check_autostart_status(expected_path: &str) -> bool {
         unsafe {
             let mut hkey = windows::Win32::System::Registry::HKEY::default();
-            let subkey: Vec<u16> = RUN_REGISTRY_PATH
-                .encode_utf16()
-                .collect();
-            
+            let subkey: Vec<u16> = RUN_REGISTRY_PATH.encode_utf16().collect();
+
             use windows::Win32::Foundation::ERROR_SUCCESS;
-            if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_ALL_ACCESS, &mut hkey) != ERROR_SUCCESS {
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                0,
+                KEY_ALL_ACCESS,
+                &mut hkey,
+            ) != ERROR_SUCCESS
+            {
                 return false;
             }
 
@@ -569,7 +641,8 @@ impl TrayManager {
             let _ = RegCloseKey(hkey);
 
             if res == ERROR_SUCCESS && dw_type == REG_SZ {
-                let actual_path = String::from_utf16_lossy(&buffer[..(len / 2).saturating_sub(1) as usize]);
+                let actual_path =
+                    String::from_utf16_lossy(&buffer[..(len / 2).saturating_sub(1) as usize]);
                 return actual_path.to_lowercase() == expected_path.to_lowercase();
             }
         }
@@ -580,35 +653,42 @@ impl TrayManager {
     fn set_autostart(path: &str, enabled: bool) -> Result<()> {
         unsafe {
             let mut hkey = windows::Win32::System::Registry::HKEY::default();
-            let subkey: Vec<u16> = RUN_REGISTRY_PATH
-                .encode_utf16()
-                .collect();
-            
+            let subkey: Vec<u16> = RUN_REGISTRY_PATH.encode_utf16().collect();
+
             use windows::Win32::Foundation::ERROR_SUCCESS;
-            let status = RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_ALL_ACCESS, &mut hkey);
+            let status = RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                0,
+                KEY_ALL_ACCESS,
+                &mut hkey,
+            );
             if status != ERROR_SUCCESS {
-                return Err(anyhow::anyhow!("Failed to open registry key: error code {}", status.0));
+                return Err(anyhow::anyhow!(
+                    "Failed to open registry key: error code {}",
+                    status.0
+                ));
             }
 
             let value_name: Vec<u16> = REG_APP_NAME.encode_utf16().collect();
-            
+
             let res = if enabled {
                 let path_wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-                let data = std::slice::from_raw_parts(path_wide.as_ptr() as *const u8, path_wide.len() * 2);
-                RegSetValueExW(
-                    hkey,
-                    PCWSTR(value_name.as_ptr()),
-                    0,
-                    REG_SZ,
-                    Some(data),
-                )
+                let data = std::slice::from_raw_parts(
+                    path_wide.as_ptr() as *const u8,
+                    path_wide.len() * 2,
+                );
+                RegSetValueExW(hkey, PCWSTR(value_name.as_ptr()), 0, REG_SZ, Some(data))
             } else {
                 RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr()))
             };
 
             let _ = RegCloseKey(hkey);
             if res != ERROR_SUCCESS {
-                return Err(anyhow::anyhow!("Registry operation failed: error code {}", res.0));
+                return Err(anyhow::anyhow!(
+                    "Registry operation failed: error code {}",
+                    res.0
+                ));
             }
         }
         Ok(())

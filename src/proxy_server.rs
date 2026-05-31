@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
-use tokio::time::{timeout, Duration};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::{Duration, timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -64,7 +64,11 @@ impl ProxyServer {
                     let permit = match self.semaphore.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            log::warn!("Max connections ({}) reached, rejecting {}", MAX_CONNECTIONS, peer_addr);
+                            log::warn!(
+                                "Max connections ({}) reached, rejecting {}",
+                                MAX_CONNECTIONS,
+                                peer_addr
+                            );
                             drop(stream);
                             continue;
                         }
@@ -72,7 +76,9 @@ impl ProxyServer {
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = handle_connection(stream, peer_addr, rules, tx, stats, tracker).await {
+                        if let Err(e) =
+                            handle_connection(stream, peer_addr, rules, tx, stats, tracker).await
+                        {
                             log::error!("Error handling connection from {}: {}", peer_addr, e);
                         }
                     });
@@ -93,6 +99,13 @@ async fn handle_connection(
     stats: Arc<TrafficStats>,
     tracker: Arc<ConnectionTracker>,
 ) -> Result<()> {
+    // Register at accept time so failed handshakes appear in the table.
+    let conn_id = tracker.register(
+        peer_addr.to_string(),
+        String::from("resolving..."),
+        String::from("detecting..."),
+    );
+
     let rules_guard = rules.load();
     let res = timeout(HANDSHAKE_TIMEOUT, async {
         let mut first_byte = [0u8; 1];
@@ -107,31 +120,39 @@ async fn handle_connection(
             handle_http(fb, stream, peer_addr, &rules_guard).await
         };
 
-        let proto = match fb {
-            0x05 => "SOCKS5",
-            0x04 => "SOCKS4",
-            _ => "HTTP",
-        };
-
-        result.map(|(s, t, h, p, proxy)| (s, t, h, p, proxy, proto.to_string()))
-    }).await;
+        result.map(|(s, t, h, p, proxy, proto)| (s, t, h, p, proxy, proto))
+    })
+    .await;
 
     match res {
         Ok(Ok((stream, target_stream, host, port, proxy_desc, protocol))) => {
             let is_direct = proxy_desc == "direct";
-            let conn_id = tracker.register(
-                peer_addr.to_string(),
-                format!("{}:{}", host, port),
-                protocol,
-            );
+            tracker.set_proxy_protocol(conn_id, protocol);
+            tracker.set_outbound_target(conn_id, format!("{}:{}", host, port));
             tracker.set_proxy(conn_id, proxy_desc.clone());
             tracker.set_connected(conn_id);
 
-            relay_data(stream, target_stream, host, port, peer_addr, tx, stats, is_direct, conn_id, tracker).await
+            relay_data(
+                stream,
+                target_stream,
+                host,
+                port,
+                peer_addr,
+                tx,
+                stats,
+                is_direct,
+                conn_id,
+                tracker,
+            )
+            .await
         }
-        Ok(Err(e)) => Err(e),
+        Ok(Err(e)) => {
+            tracker.set_error(conn_id, &e.to_string());
+            Err(e)
+        }
         Err(_) => {
             log::warn!("Handshake with {} timed out", peer_addr);
+            tracker.set_error(conn_id, "Handshake timed out");
             Err(anyhow::anyhow!("Handshake timed out"))
         }
     }
@@ -142,7 +163,7 @@ async fn handle_socks4(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16, String)> {
+) -> Result<(TcpStream, TcpStream, String, u16, String, String)> {
     // SOCKS4 header: CMD (1), DSTPORT (2), DSTIP (4)
     let mut header = [0u8; 7];
     stream.read_exact(&mut header).await?;
@@ -162,9 +183,13 @@ async fn handle_socks4(
     let mut byte = [0u8; 1];
     loop {
         stream.read_exact(&mut byte).await?;
-        if byte[0] == 0 { break; }
+        if byte[0] == 0 {
+            break;
+        }
         user_id.push(byte[0]);
-        if user_id.len() > 255 { return Err(anyhow::anyhow!("SOCKS4 User ID too long")); }
+        if user_id.len() > 255 {
+            return Err(anyhow::anyhow!("SOCKS4 User ID too long"));
+        }
     }
 
     let host = if is_socks4a {
@@ -172,24 +197,47 @@ async fn handle_socks4(
         let mut domain = vec![];
         loop {
             stream.read_exact(&mut byte).await?;
-            if byte[0] == 0 { break; }
+            if byte[0] == 0 {
+                break;
+            }
             domain.push(byte[0]);
-            if domain.len() > 255 { return Err(anyhow::anyhow!("SOCKS4a domain too long")); }
+            if domain.len() > 255 {
+                return Err(anyhow::anyhow!("SOCKS4a domain too long"));
+            }
         }
         String::from_utf8_lossy(&domain).to_string()
     } else {
         Ipv4Addr::from(ip_bytes).to_string()
     };
 
-    let ip = if is_socks4a { None } else { Some(IpAddr::V4(Ipv4Addr::from(ip_bytes))) };
+    let ip = if is_socks4a {
+        None
+    } else {
+        Some(IpAddr::V4(Ipv4Addr::from(ip_bytes)))
+    };
 
-    log::info!("SOCKS4{} request from {}: {}:{}", if is_socks4a { "a" } else { "" }, peer_addr, host, port);
+    log::info!(
+        "SOCKS4{} request from {}: {}:{}",
+        if is_socks4a { "a" } else { "" },
+        peer_addr,
+        host,
+        port
+    );
 
-    let (target_stream, proxy_desc) = connect_to_target(&host, port, is_socks4a, ip, &rules, &mut stream, false).await?;
+    let (target_stream, proxy_desc) =
+        connect_to_target(&host, port, is_socks4a, ip, &rules, &mut stream, false).await?;
 
     send_socks4_reply(&mut stream, 0x5A).await?;
 
-    Ok((stream, target_stream, host, port, proxy_desc))
+    let proto = if is_socks4a { "SOCKS4a" } else { "SOCKS4" };
+    Ok((
+        stream,
+        target_stream,
+        host,
+        port,
+        proxy_desc,
+        proto.to_string(),
+    ))
 }
 
 async fn send_socks4_reply(stream: &mut TcpStream, status: u8) -> Result<()> {
@@ -205,7 +253,7 @@ async fn handle_socks5(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16, String)> {
+) -> Result<(TcpStream, TcpStream, String, u16, String, String)> {
     // We already read the first byte (version 0x05)
     let mut second_byte = [0u8; 1];
     stream.read_exact(&mut second_byte).await?;
@@ -214,11 +262,7 @@ async fn handle_socks5(
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    let selected_method = if methods.contains(&0x00) {
-        0x00
-    } else {
-        0xFF
-    };
+    let selected_method = if methods.contains(&0x00) { 0x00 } else { 0xFF };
 
     let mut response = [0u8; 2];
     response[0] = 0x05;
@@ -283,11 +327,24 @@ async fn handle_socks5(
 
     log::info!("SOCKS5 request from {}: {}:{}", peer_addr, host, port);
 
-    let (target_stream, proxy_desc) = connect_to_target(&host, port, resolve_hostname, ip, &rules, &mut stream, true).await?;
+    let (target_stream, proxy_desc) =
+        connect_to_target(&host, port, resolve_hostname, ip, &rules, &mut stream, true).await?;
 
     send_success_reply(&mut stream).await?;
 
-    Ok((stream, target_stream, host, port, proxy_desc))
+    let proto = if resolve_hostname {
+        "SOCKS5h"
+    } else {
+        "SOCKS5"
+    };
+    Ok((
+        stream,
+        target_stream,
+        host,
+        port,
+        proxy_desc,
+        proto.to_string(),
+    ))
 }
 
 async fn handle_http(
@@ -295,7 +352,7 @@ async fn handle_http(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16, String)> {
+) -> Result<(TcpStream, TcpStream, String, u16, String, String)> {
     let mut request_line = vec![first_byte];
     let mut byte = [0u8; 1];
     loop {
@@ -314,7 +371,10 @@ async fn handle_http(
 
     let parts: Vec<&str> = request_line_str.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(anyhow::anyhow!("Invalid HTTP request line: {}", request_line_str));
+        return Err(anyhow::anyhow!(
+            "Invalid HTTP request line: {}",
+            request_line_str
+        ));
     }
 
     let method = parts[0];
@@ -323,7 +383,8 @@ async fn handle_http(
     let (host, port, is_connect) = if method.to_uppercase() == "CONNECT" {
         if uri.starts_with('[') {
             // IPv6: [::1]:443
-            let end_bracket = uri.find(']')
+            let end_bracket = uri
+                .find(']')
                 .ok_or_else(|| anyhow::anyhow!("Invalid IPv6 CONNECT URI: {}", uri))?;
             let host = uri[1..end_bracket].to_string();
             let port = if uri.len() > end_bracket + 2 && uri.as_bytes()[end_bracket + 1] == b':' {
@@ -341,15 +402,27 @@ async fn handle_http(
             (host, port, true)
         }
     } else {
-        let uri_parsed = uri.parse::<http::Uri>().map_err(|_| anyhow::anyhow!("Failed to parse URI: {}", uri))?;
-        let host = uri_parsed.host().ok_or_else(|| anyhow::anyhow!("Missing host in HTTP URI"))?.to_string();
+        let uri_parsed = uri
+            .parse::<http::Uri>()
+            .map_err(|_| anyhow::anyhow!("Failed to parse URI: {}", uri))?;
+        let host = uri_parsed
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("Missing host in HTTP URI"))?
+            .to_string();
         let port = uri_parsed.port_u16().unwrap_or(80);
         (host, port, false)
     };
 
-    log::info!("HTTP {} request from {}: {}:{}", method, peer_addr, host, port);
+    log::info!(
+        "HTTP {} request from {}: {}:{}",
+        method,
+        peer_addr,
+        host,
+        port
+    );
 
-    let (mut target_stream, proxy_desc) = connect_to_target(&host, port, true, None, &rules, &mut stream, false).await?;
+    let (mut target_stream, proxy_desc) =
+        connect_to_target(&host, port, true, None, &rules, &mut stream, false).await?;
 
     if is_connect {
         // CONNECT request: read headers until empty line (discard them)
@@ -365,7 +438,9 @@ async fn handle_http(
                 return Err(anyhow::anyhow!("HTTP CONNECT headers too long"));
             }
         }
-        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
     } else {
         // Regular GET/POST request: rewrite the request line to origin-form and forward.
         //
@@ -381,24 +456,37 @@ async fn handle_http(
                 let path = if path.is_empty() { "/" } else { path };
                 match parsed.query() {
                     Some(q) => format!("{path}?{q}"),
-                    None    => path.to_string(),
+                    None => path.to_string(),
                 }
             } else {
                 // Fallback: strip scheme+authority manually
                 let after_scheme = &uri[uri.find("://").map(|i| i + 3).unwrap_or(0)..];
-                let path_start = after_scheme.find('/').map(|i| i).unwrap_or(after_scheme.len());
+                let path_start = after_scheme
+                    .find('/')
+                    .map(|i| i)
+                    .unwrap_or(after_scheme.len());
                 let path = &after_scheme[path_start..];
-                if path.is_empty() { "/".to_string() } else { path.to_string() }
+                if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    path.to_string()
+                }
             };
-            let version = if parts.len() >= 3 { parts[2] } else { "HTTP/1.1" };
+            let version = if parts.len() >= 3 {
+                parts[2]
+            } else {
+                "HTTP/1.1"
+            };
             format!("{method} {origin} {version}\r\n").into_bytes()
         } else {
             // Already origin-form (Edge sends this); forward as-is.
             request_line.clone()
         };
 
-        log::debug!("Forwarding request line (origin-form): {}",
-            String::from_utf8_lossy(&rewritten_line).trim());
+        log::debug!(
+            "Forwarding request line (origin-form): {}",
+            String::from_utf8_lossy(&rewritten_line).trim()
+        );
         target_stream.write_all(&rewritten_line).await?;
 
         // Relay headers until \r\n\r\n
@@ -417,7 +505,14 @@ async fn handle_http(
         target_stream.write_all(&headers).await?;
     }
 
-    Ok((stream, target_stream, host, port, proxy_desc))
+    Ok((
+        stream,
+        target_stream,
+        host,
+        port,
+        proxy_desc,
+        "HTTP".to_string(),
+    ))
 }
 
 async fn connect_to_target(
@@ -431,7 +526,11 @@ async fn connect_to_target(
 ) -> Result<(TcpStream, String)> {
     for (matcher, proxy_config) in rules {
         if matcher.matches(host, ip) {
-            log::info!("Matched rule, forwarding {} to proxy: {}", host, proxy_config.addr);
+            log::info!(
+                "Matched rule, forwarding {} to proxy: {}",
+                host,
+                proxy_config.addr
+            );
             let scheme = match proxy_config.proxy_type {
                 ProxyType::Socks5 => "socks5",
                 ProxyType::Socks5h => "socks5h",
@@ -451,7 +550,7 @@ async fn connect_to_target(
             }
         }
     }
- 
+
     log::info!("No rule matched, connecting directly to {}:{}", host, port);
     match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
         Ok(Ok(s)) => Ok((s, "direct".to_string())),
