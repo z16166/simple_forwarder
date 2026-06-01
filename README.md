@@ -2,6 +2,10 @@
 
 A high-performance Multi-Protocol Proxy Forwarder written in Rust 2024 Edition.
 
+## Screenshot
+
+![Simple Forwarder](screenshot.jpg)
+
 ## Features
 
 - **Multi-Protocol Inbound**: Automatically detects and handles SOCKS5, SOCKS4, and HTTP proxy protocols on the same port.
