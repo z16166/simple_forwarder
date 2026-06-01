@@ -160,14 +160,14 @@ fn run_traffic_window(
 
     let columns = [
         "Source",
-        "Outbound Target",
-        "Exe",
-        "Proxy Protocol",
-        "Proxy",
+        "Target",
+        "EXE",
+        "Inbound",
+        "Outbound",
         "Start Time",
         "Status",
-        "Bytes Sent",
-        "Bytes Received",
+        "Sent",
+        "Received",
     ];
     // Columns 0–6 use the default text color.
     for (i, title) in columns.iter().enumerate().take(7) {
@@ -176,13 +176,13 @@ fn run_traffic_window(
     // Columns 7–8 (Bytes Sent / Received) drive their text color from the
     // hidden model columns 9 and 10 respectively.
     table.append_text_column_with_params(
-        "Bytes Sent",
+        "Sent",
         COL_BYTES_SENT,
         Table::COLUMN_READONLY,
         TextColumnParameters { text_color_column: COL_COLOR_SENT },
     );
     table.append_text_column_with_params(
-        "Bytes Received",
+        "Received",
         COL_BYTES_RECV,
         Table::COLUMN_READONLY,
         TextColumnParameters { text_color_column: COL_COLOR_RECV },
@@ -191,7 +191,7 @@ fn run_traffic_window(
     table.set_column_width(1, 260); // Outbound Target
     table.set_column_width(2, 160); // Exe
     table.set_column_width(4, 220); // Proxy
-    table.set_column_width(5, 180); // Start Time
+    table.set_column_width(5, 150); // Start Time
 
     #[cfg(windows)]
     let table_hwnd = {
