@@ -13,11 +13,6 @@ use libui::controls::{
 use crate::connection_tracker::ConnectionTracker;
 use crate::stats::TrafficStats;
 
-#[cfg(windows)]
-unsafe extern "system" {
-    fn LockWindowUpdate(hWndLock: *mut std::ffi::c_void);
-}
-
 struct TrafficDataSource {
     connections: Vec<crate::connection_tracker::ConnectionInfo>,
 }
@@ -122,6 +117,28 @@ fn run_traffic_window(
         get_control_hwnd(&control).0
     };
 
+    // Enable double-buffering on the ListView. This is the standard fix for
+    // ListView flicker on Windows: erase + paint happen in an off-screen buffer
+    // and are blit to the screen atomically, so no intermediate blank state is
+    // ever visible, regardless of how many rows are updated per tick.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::Controls::{LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER};
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let hwnd = HWND(table_hwnd);
+        unsafe {
+            // WPARAM = style mask (which bits to set), LPARAM = style value
+            SendMessageW(
+                hwnd,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                WPARAM(LVS_EX_DOUBLEBUFFER as usize),
+                LPARAM(LVS_EX_DOUBLEBUFFER as isize),
+            );
+        }
+    }
+
     let mut window = Window::new(&ui, "Real-time Traffic", 1100, 500, WindowType::NoMenubar);
     window.set_margined(true);
     window.set_child(table);
@@ -163,9 +180,11 @@ fn run_traffic_window(
         w.show();
 
         #[cfg(windows)]
-        {
-            use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindow};
+        let table_redraw_locked = {
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetClientRect, IsWindow, SendMessageW, WM_SETREDRAW,
+            };
 
             let hwnd = HWND(table_hwnd);
             if unsafe { IsWindow(hwnd) }.as_bool() {
@@ -185,11 +204,19 @@ fn run_traffic_window(
                     }
                 }
 
+                // Suppress all intermediate redraws during batch notify_row_* calls.
+                // WM_SETREDRAW(FALSE) is the correct API for ListView bulk updates;
+                // LockWindowUpdate only works at the desktop compositor level and
+                // does not prevent the per-item LVM_* messages from causing partial
+                // redraws inside the control.
                 unsafe {
-                    LockWindowUpdate(table_hwnd);
+                    let _ = SendMessageW(hwnd, WM_SETREDRAW, WPARAM(0), LPARAM(0));
                 }
+                true
+            } else {
+                false
             }
-        }
+        };
 
         drop(w); // Release window borrow before model operations
 
@@ -209,16 +236,21 @@ fn run_traffic_window(
         //   ensures each deletion doesn't shift indices of the remaining
         //   not-yet-deleted rows.
         //
-        //   After step 1, the model has the same set of rows (and same order)
-        //   as the new data source. The surviving rows are at identical
-        //   positions in both the post-deletion model and the data source.
+        //   After step 1, surviving rows occupy a compact prefix that is a
+        //   subsequence of the new snapshot, but new rows have not yet been
+        //   inserted. All surviving rows are still shifted LEFT relative to
+        //   their final new-snapshot positions.
         //
-        //   Step 2 — changed rows use NEW data-source indices, which now
-        //   match the model's post-deletion state.
+        //   Step 2 — insertions (new indices, low→high). Each insertion at
+        //   new_idx pushes subsequent surviving rows one slot to the right,
+        //   progressively moving them to their correct final positions. After
+        //   all insertions the view layout exactly matches the new snapshot.
         //
-        //   Step 3 — insertions also use NEW data-source indices. Inserting
-        //   low-to-high is correct because step 1 already removed all stale
-        //   rows; the model's row count is exactly new_len - insert_count.
+        //   Step 3 — change notifications. Only now are all new_idx values
+        //   valid in the view. Calling notify_row_changed BEFORE insertions
+        //   would reference indices that don't exist yet (or refer to wrong
+        //   rows), causing the view to repaint the wrong row with the new
+        //   data — the root cause of the "flickering from a certain row" bug.
         let old_idx_by_id: HashMap<u64, usize> = old_connections
             .iter()
             .enumerate()
@@ -235,7 +267,16 @@ fn run_traffic_window(
             model.notify_row_deleted(*idx as i32);
         }
 
-        // 2. Notify changed rows (new indices — model now == data source)
+        // 2. Insert genuinely new rows (new indices, low→high).
+        //    MUST happen before notify_row_changed so that surviving rows
+        //    reach their correct new-snapshot positions first.
+        for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
+            if !old_idx_by_id.contains_key(&conn.id) {
+                model.notify_row_inserted(new_idx as i32);
+            }
+        }
+
+        // 3. Notify changed rows — all new_idx values are now valid in the view.
         for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
             if let Some(&old_idx) = old_idx_by_id.get(&conn.id) {
                 if old_connections[old_idx] != *conn {
@@ -244,16 +285,30 @@ fn run_traffic_window(
             }
         }
 
-        // 3. Insert genuinely new rows (new indices, low→high)
-        for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
-            if !old_idx_by_id.contains_key(&conn.id) {
-                model.notify_row_inserted(new_idx as i32);
-            }
-        }
+        // IMPORTANT: drop both borrows *before* the redraw calls below.
+        // UpdateWindow() is synchronous — it fires WM_PAINT inline, which
+        // triggers NM_CUSTOMDRAW → libui calls cell() on the data source,
+        // which attempts a RefCell::borrow(). If ds_mut or model are still
+        // held at that point the borrow check panics.
+        drop(model);
+        drop(ds_mut);
 
+        // Re-enable redraws and force a single coherent repaint of the whole
+        // table, so all changes appear atomically instead of row-by-row.
         #[cfg(windows)]
-        unsafe {
-            LockWindowUpdate(std::ptr::null_mut());
+        if table_redraw_locked {
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
+            use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_SETREDRAW};
+
+            let hwnd = HWND(table_hwnd);
+            unsafe {
+                let _ = SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+                // Invalidate without erase: the double-buffered paint will
+                // redraw all cells correctly without a visible blank frame.
+                let _ = InvalidateRect(hwnd, None, false);
+                let _ = UpdateWindow(hwnd);
+            }
         }
     });
 
@@ -263,10 +318,6 @@ fn run_traffic_window(
     // run_delay only returns if all windows are destroyed (which we prevent
     // via on_closing). If it ever does, reset the thread_running flag so a
     // fresh thread can be spawned.
-    #[cfg(windows)]
-    unsafe {
-        LockWindowUpdate(std::ptr::null_mut());
-    }
 
     Ok(())
 }

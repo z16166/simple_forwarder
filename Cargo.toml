@@ -1,6 +1,6 @@
 [package]
 name = "simple_forwarder"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 
 [dependencies]
@@ -26,7 +26,7 @@ libui-ffi = "0.4.0"
 netstat2 = "0.11"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_Etw", "Win32_Security"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_System_Threading", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_Etw", "Win32_Security"] }
 ferrisetw = "1.2"
 
 [profile.release]
