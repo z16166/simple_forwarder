@@ -6,33 +6,90 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use libui::UI;
 use libui::controls::{
-    Table, TableDataSource, TableModel, TableParameters, TableValue, TableValueType, Window,
-    WindowType,
+    Table, TableDataSource, TableModel, TableParameters, TableValue, TableValueType,
+    TextColumnParameters, Window, WindowType,
 };
 
 use crate::connection_tracker::ConnectionTracker;
 use crate::stats::TrafficStats;
 
+// Dark forest-green highlight color (#1A8C1A — readable on white backgrounds).
+const HIGHLIGHT: TableValue = TableValue::Color { r: 0.10, g: 0.55, b: 0.10, a: 1.0 };
+// Opaque black — used as the "no highlight" fallback.
+// NOTE: alpha=0.0 does NOT mean "use system default" in libui-ng on Windows;
+//       it renders the text fully transparent (invisible on a white background).
+//       We must return an explicit opaque color instead.
+const DEFAULT_COLOR: TableValue = TableValue::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+
+const TOP_N: usize = 5;
+/// Minimum bytes to qualify for the top-5 highlight (10 MiB).
+const HIGHLIGHT_MIN_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Model column indices (total: 11).
+/// Columns 0–8: visible data.  Columns 9–10: hidden color drivers.
+const COL_BYTES_SENT: i32 = 7;
+const COL_BYTES_RECV: i32 = 8;
+const COL_COLOR_SENT: i32 = 9;
+const COL_COLOR_RECV: i32 = 10;
+
 struct TrafficDataSource {
     connections: Vec<crate::connection_tracker::ConnectionInfo>,
+    /// IDs of the top-N connections by bytes sent (precomputed each tick).
+    top_sent: HashSet<u64>,
+    /// IDs of the top-N connections by bytes received (precomputed each tick).
+    top_recv: HashSet<u64>,
+}
+
+impl TrafficDataSource {
+    /// Recompute `top_sent` / `top_recv` after `connections` has been updated.
+    /// Called once per tick; O(n log n) but n is at most a few thousand rows.
+    fn recompute_highlights(&mut self) {
+        // Top-N by bytes_sent where bytes_sent > HIGHLIGHT_MIN_BYTES.
+        let mut by_sent: Vec<(u64, u64)> = self
+            .connections
+            .iter()
+            .filter(|c| c.bytes_sent > HIGHLIGHT_MIN_BYTES)
+            .map(|c| (c.id, c.bytes_sent))
+            .collect();
+        by_sent.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        self.top_sent = by_sent.iter().take(TOP_N).map(|&(id, _)| id).collect();
+
+        // Top-N by bytes_received where bytes_received > HIGHLIGHT_MIN_BYTES.
+        let mut by_recv: Vec<(u64, u64)> = self
+            .connections
+            .iter()
+            .filter(|c| c.bytes_received > HIGHLIGHT_MIN_BYTES)
+            .map(|c| (c.id, c.bytes_received))
+            .collect();
+        by_recv.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        self.top_recv = by_recv.iter().take(TOP_N).map(|&(id, _)| id).collect();
+    }
 }
 
 impl TableDataSource for TrafficDataSource {
     fn num_columns(&mut self) -> i32 {
-        9
+        // 9 visible + 2 hidden color columns.
+        11
     }
 
     fn num_rows(&mut self) -> i32 {
         self.connections.len() as i32
     }
 
-    fn column_type(&mut self, _column: i32) -> TableValueType {
-        TableValueType::String
+    fn column_type(&mut self, column: i32) -> TableValueType {
+        match column {
+            COL_COLOR_SENT | COL_COLOR_RECV => TableValueType::Color,
+            _ => TableValueType::String,
+        }
     }
 
     fn cell(&mut self, column: i32, row: i32) -> TableValue {
         let Some(conn) = self.connections.get(row as usize) else {
-            return TableValue::String(String::new());
+            // For color columns we must still return a valid Color value.
+            return match column {
+                COL_COLOR_SENT | COL_COLOR_RECV => DEFAULT_COLOR,
+                _ => TableValue::String(String::new()),
+            };
         };
         match column {
             0 => TableValue::String(conn.source_ip.clone()),
@@ -42,8 +99,15 @@ impl TableDataSource for TrafficDataSource {
             4 => TableValue::String(conn.proxy.clone()),
             5 => TableValue::String(conn.start_time.clone()),
             6 => TableValue::String(conn.status.clone()),
-            7 => TableValue::String(TrafficStats::format_bytes(conn.bytes_sent)),
-            8 => TableValue::String(TrafficStats::format_bytes(conn.bytes_received)),
+            COL_BYTES_SENT => TableValue::String(TrafficStats::format_bytes(conn.bytes_sent)),
+            COL_BYTES_RECV => TableValue::String(TrafficStats::format_bytes(conn.bytes_received)),
+            // Hidden color columns: return highlight color for top-N, default otherwise.
+            COL_COLOR_SENT => {
+                if self.top_sent.contains(&conn.id) { HIGHLIGHT } else { DEFAULT_COLOR }
+            }
+            COL_COLOR_RECV => {
+                if self.top_recv.contains(&conn.id) { HIGHLIGHT } else { DEFAULT_COLOR }
+            }
             _ => TableValue::String(String::new()),
         }
     }
@@ -82,9 +146,13 @@ fn run_traffic_window(
     let ui = UI::init()?;
 
     let initial_snapshot = tracker.snapshot();
-    let data_source = Rc::new(RefCell::new(TrafficDataSource {
+    let mut initial_ds = TrafficDataSource {
         connections: initial_snapshot,
-    }));
+        top_sent: HashSet::new(),
+        top_recv: HashSet::new(),
+    };
+    initial_ds.recompute_highlights();
+    let data_source = Rc::new(RefCell::new(initial_ds));
     let model = Rc::new(RefCell::new(TableModel::new(data_source.clone())));
     let params = TableParameters::new(model.clone());
     let mut table = Table::new(params);
@@ -101,9 +169,24 @@ fn run_traffic_window(
         "Bytes Sent",
         "Bytes Received",
     ];
-    for (i, title) in columns.iter().enumerate() {
+    // Columns 0–6 use the default text color.
+    for (i, title) in columns.iter().enumerate().take(7) {
         table.append_text_column(title, i as i32, Table::COLUMN_READONLY);
     }
+    // Columns 7–8 (Bytes Sent / Received) drive their text color from the
+    // hidden model columns 9 and 10 respectively.
+    table.append_text_column_with_params(
+        "Bytes Sent",
+        COL_BYTES_SENT,
+        Table::COLUMN_READONLY,
+        TextColumnParameters { text_color_column: COL_COLOR_SENT },
+    );
+    table.append_text_column_with_params(
+        "Bytes Received",
+        COL_BYTES_RECV,
+        Table::COLUMN_READONLY,
+        TextColumnParameters { text_color_column: COL_COLOR_RECV },
+    );
     table.set_column_width(0, 200); // Source
     table.set_column_width(1, 260); // Outbound Target
     table.set_column_width(2, 160); // Exe
@@ -223,7 +306,18 @@ fn run_traffic_window(
         let snapshot = trk.snapshot();
         let mut ds_mut = ds.borrow_mut();
         let old_connections = std::mem::take(&mut ds_mut.connections);
+        // old_top_* are needed to detect rank changes that would require
+        // a notify_row_changed even if the raw bytes values are unchanged.
+        // (The full InvalidateRect at the end of the tick covers this on
+        // Windows, but explicit notifications keep non-Windows builds correct.)
+        let old_top_sent = std::mem::take(&mut ds_mut.top_sent);
+        let old_top_recv = std::mem::take(&mut ds_mut.top_recv);
         ds_mut.connections = snapshot;
+        // Recompute top-N sets before any notifications so that color
+        // columns already reflect the new ranking when cells are repainted.
+        ds_mut.recompute_highlights();
+        let new_top_sent = ds_mut.top_sent.clone();
+        let new_top_recv = ds_mut.top_recv.clone();
 
         let model = mdl.borrow();
 
@@ -277,9 +371,16 @@ fn run_traffic_window(
         }
 
         // 3. Notify changed rows — all new_idx values are now valid in the view.
+        //    Also notify rows whose highlight rank changed even if the row data
+        //    itself didn't change (avoids stale color on non-Windows platforms
+        //    that don't rely on the blanket InvalidateRect at the end of the tick).
         for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
             if let Some(&old_idx) = old_idx_by_id.get(&conn.id) {
-                if old_connections[old_idx] != *conn {
+                let data_changed = old_connections[old_idx] != *conn;
+                let rank_changed =
+                    old_top_sent.contains(&conn.id) != new_top_sent.contains(&conn.id)
+                    || old_top_recv.contains(&conn.id) != new_top_recv.contains(&conn.id);
+                if data_changed || rank_changed {
                     model.notify_row_changed(new_idx as i32);
                 }
             }
