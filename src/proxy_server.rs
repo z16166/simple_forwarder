@@ -8,14 +8,13 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONNECTIONS: usize = 1024;
 
 use crate::connection_tracker::ConnectionTracker;
 use crate::etw_resolver::ExeResolver;
 use crate::matcher::RuleMatcher;
-use crate::proxy_client::{ProxyClient, ProxyConfig, ProxyType};
+use crate::proxy_client::{CONNECT_TIMEOUT, ProxyClient, ProxyConfig, ProxyType};
 use crate::stats::TrafficStats;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -99,6 +98,7 @@ impl ProxyServer {
     }
 }
 
+#[derive(Debug)]
 pub struct HandshakeResult {
     pub client_stream: TcpStream,
     pub target_stream: TcpStream,
@@ -341,8 +341,8 @@ async fn handle_socks5(
     stream.read_exact(&mut second_byte).await?;
     let nmethods = second_byte[0] as usize;
 
-    if nmethods == 0 {
-        return Err(anyhow::anyhow!("SOCKS5 nmethods must be greater than 0"));
+    if nmethods == 0 || nmethods > 255 {
+        return Err(anyhow::anyhow!("SOCKS5 nmethods must be between 1 and 255"));
     }
 
     let mut methods = vec![0u8; nmethods];
@@ -388,10 +388,10 @@ async fn handle_socks5(
             let mut len_buf = [0u8; 1];
             stream.read_exact(&mut len_buf).await?;
             let len = len_buf[0] as usize;
-            if len == 0 {
+            if len == 0 || len > 253 {
                 send_error_reply(&mut stream, 0x08).await?;
                 return Err(anyhow::anyhow!(
-                    "SOCKS5 domain name length must be greater than 0"
+                    "SOCKS5 domain name length must be between 1 and 253"
                 ));
             }
             let mut host_buf = vec![0u8; len];
@@ -592,27 +592,18 @@ async fn handle_http(
         port
     );
 
-    let (mut target_stream, proxy_desc, is_direct) = match connect_to_target(
-        &host,
-        port,
-        true,
-        None,
-        rules,
-        &mut stream,
-        false,
-    )
-    .await
-    {
-        Ok(res) => res,
-        Err(e) => {
-            let _ = stream
+    let (mut target_stream, proxy_desc, is_direct) =
+        match connect_to_target(&host, port, true, None, rules, &mut stream, false).await {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = stream
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .await;
-            return Err(e);
-        }
-    };
+                return Err(e);
+            }
+        };
 
     if is_connect {
         // CONNECT request: send the success response back to the client.
@@ -938,5 +929,60 @@ mod tests {
         // Test start_pos optimization
         let b6 = b"Host: localhost\r\n\r\nLeftover data";
         assert_eq!(find_header_separator(b6, 15), Some(19));
+    }
+
+    #[tokio::test]
+    async fn test_socks5_bounds_checking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 1. Test case: nmethods = 0
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // Send VER=5, NMETHODS=0
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+        });
+        let (mut server_stream, peer_addr) = listener.accept().await.unwrap();
+        let mut first_byte = [0u8; 1];
+        server_stream.read_exact(&mut first_byte).await.unwrap();
+        let rules: Vec<(RuleMatcher, ProxyConfig)> = vec![];
+        let res = handle_socks5(first_byte[0], server_stream, peer_addr, &rules).await;
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("SOCKS5 nmethods must be between 1 and 255")
+        );
+        client_task.await.unwrap();
+
+        // 2. Test case: domain name length = 254 (invalid, > 253)
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // Send VER=5, NMETHODS=1, METHOD=00
+            stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            // Read server method select response
+            let mut resp = [0u8; 2];
+            stream.read_exact(&mut resp).await.unwrap();
+            assert_eq!(resp, [0x05, 0x00]);
+            // Send request: VER=5, CMD=1, RSV=0, ATYP=3 (domain), LEN=254 (no host/port payload, triggers early bounds check)
+            let req = vec![0x05, 0x01, 0x00, 0x03, 254];
+            stream.write_all(&req).await.unwrap();
+            // Read error reply
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[0], 0x05); // VER
+            assert_eq!(reply[1], 0x08); // REP (0x08 = Address type not supported)
+        });
+        let (mut server_stream, peer_addr) = listener.accept().await.unwrap();
+        let mut first_byte = [0u8; 1];
+        server_stream.read_exact(&mut first_byte).await.unwrap();
+        let res = handle_socks5(first_byte[0], server_stream, peer_addr, &rules).await;
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("SOCKS5 domain name length must be between 1 and 253")
+        );
+        client_task.await.unwrap();
     }
 }

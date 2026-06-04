@@ -1,5 +1,5 @@
 log:
-  log_type: console
+  log_type: none
   level: warn
   file: null
 
