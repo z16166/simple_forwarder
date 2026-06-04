@@ -1949,6 +1949,7 @@ dependencies = [
  "log",
  "netstat2",
  "notify",
+ "parking_lot",
  "serde",
  "single-instance",
  "tokio",

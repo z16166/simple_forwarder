@@ -107,7 +107,8 @@ mod netstat_fallback {
 #[cfg(windows)]
 mod imp {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -142,20 +143,19 @@ mod imp {
         /// Tokio worker thread pool.
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
             // Fast path: already-resolved cache.
-            if let Some(exe) = self.port_to_exe.lock().unwrap().get(&remote_port).cloned() {
+            if let Some(exe) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
             // ETW-provided PID — resolve in spawn_blocking.
             // Guard must be dropped before the await point.
-            let etw_pid = self.port_to_pid.lock().unwrap().get(&remote_port).copied();
+            let etw_pid = self.port_to_pid.lock().get(&remote_port).copied();
             if let Some(pid) = etw_pid {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
                 self.port_to_exe
                     .lock()
-                    .unwrap()
                     .insert(remote_port, exe.clone());
                 return Some(exe);
             }
@@ -169,22 +169,21 @@ mod imp {
             .ok()??;
 
             // Cache the PID so future lookups on this port avoid another scan.
-            self.port_to_pid.lock().unwrap().insert(remote_port, result);
+            self.port_to_pid.lock().insert(remote_port, result);
 
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
             self.port_to_exe
                 .lock()
-                .unwrap()
                 .insert(remote_port, exe.clone());
             Some(exe)
         }
 
         /// Evict cached entries for a port that is no longer in use.
         pub fn remove(&self, port: u16) {
-            self.port_to_pid.lock().unwrap().remove(&port);
-            self.port_to_exe.lock().unwrap().remove(&port);
+            self.port_to_pid.lock().remove(&port);
+            self.port_to_exe.lock().remove(&port);
         }
     }
 
@@ -263,7 +262,7 @@ mod imp {
                             // Store only the PID — cheap, no syscalls.
                             // Exe name resolution is deferred to `lookup()`
                             // so we never block the ETW consumer thread.
-                            let mut map = port_to_pid.lock().unwrap();
+                            let mut map = port_to_pid.lock();
                             if !map.contains_key(&sport) {
                                 map.insert(sport, pid);
                                 log::debug!("ETW: captured pid={}, sport={}", pid, sport);
@@ -390,7 +389,8 @@ pub use imp::ExeResolver;
 #[cfg(not(windows))]
 mod imp {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -409,18 +409,17 @@ mod imp {
         }
 
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
-            if let Some(exe) = self.port_to_exe.lock().unwrap().get(&remote_port).cloned() {
+            if let Some(exe) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
-            let cached_pid = self.port_to_pid.lock().unwrap().get(&remote_port).copied();
+            let cached_pid = self.port_to_pid.lock().get(&remote_port).copied();
             if let Some(pid) = cached_pid {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
                 self.port_to_exe
                     .lock()
-                    .unwrap()
                     .insert(remote_port, exe.clone());
                 return Some(exe);
             }
@@ -432,21 +431,20 @@ mod imp {
             .await
             .ok()??;
 
-            self.port_to_pid.lock().unwrap().insert(remote_port, result);
+            self.port_to_pid.lock().insert(remote_port, result);
 
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
             self.port_to_exe
                 .lock()
-                .unwrap()
                 .insert(remote_port, exe.clone());
             Some(exe)
         }
 
         pub fn remove(&self, port: u16) {
-            self.port_to_pid.lock().unwrap().remove(&port);
-            self.port_to_exe.lock().unwrap().remove(&port);
+            self.port_to_pid.lock().remove(&port);
+            self.port_to_exe.lock().remove(&port);
         }
     }
 }

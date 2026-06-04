@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use parking_lot::Mutex;
 
 const MAX_CONNECTIONS: usize = 5000;
 const CLOSED_RETENTION: Duration = Duration::from_secs(5);
@@ -62,7 +63,7 @@ impl ConnectionTracker {
             exe_name: String::new(),
             closed_at: None,
         };
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.connections.insert(id, info);
         state.order.push_back(id);
         if state.order.len() > MAX_CONNECTIONS {
@@ -81,42 +82,42 @@ impl ConnectionTracker {
     }
 
     pub fn set_exe_name(&self, id: u64, exe_name: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.exe_name = exe_name;
         }
     }
 
     pub fn set_proxy(&self, id: u64, proxy: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.proxy = proxy;
         }
     }
 
     pub fn set_outbound_target(&self, id: u64, target: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.outbound_target = target;
         }
     }
 
     pub fn set_proxy_protocol(&self, id: u64, protocol: String) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.proxy_protocol = protocol;
         }
     }
 
     pub fn set_connected(&self, id: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.status = String::from("connected");
         }
     }
 
     pub fn set_closed(&self, id: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.status = String::from("closed");
             conn.closed_at = Some(Instant::now());
@@ -124,7 +125,7 @@ impl ConnectionTracker {
     }
 
     pub fn set_error(&self, id: u64, err: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.status = format!("error: {}", err);
             conn.closed_at = Some(Instant::now());
@@ -132,21 +133,21 @@ impl ConnectionTracker {
     }
 
     pub fn add_bytes_sent(&self, id: u64, n: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.bytes_sent += n;
         }
     }
 
     pub fn add_bytes_received(&self, id: u64, n: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
             conn.bytes_received += n;
         }
     }
 
     pub fn snapshot(&self) -> Vec<ConnectionInfo> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         let state = &mut *guard;
         state.connections.retain(|_, c| c.closed_at.map_or(true, |t| t.elapsed() < CLOSED_RETENTION));
         let active_connections = &state.connections;
