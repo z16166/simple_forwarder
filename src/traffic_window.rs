@@ -463,6 +463,7 @@ fn get_control_hwnd(control: &libui::controls::Control) -> windows::Win32::Found
 }
 
 #[cfg(windows)]
+#[allow(clippy::manual_dangling_ptr)]
 fn set_window_icon(window: &Window) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -477,7 +478,7 @@ fn set_window_icon(window: &Window) {
     };
 
     // Resource ID 1 is the main icon embedded by winres
-    let hicon = match unsafe { LoadIconW(hinstance, PCWSTR(std::ptr::dangling::<u16>())) } {
+    let hicon = match unsafe { LoadIconW(hinstance, PCWSTR(1 as *const u16)) } {
         Ok(h) => h,
         Err(_) => return,
     };
