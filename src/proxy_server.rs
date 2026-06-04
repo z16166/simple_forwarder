@@ -640,6 +640,9 @@ async fn relay_data(
 ) -> Result<()> {
     let _ = tx.try_send(());
 
+    let tx_for_client = tx.clone();
+    let tx_for_target = tx;
+
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
@@ -656,6 +659,7 @@ async fn relay_data(
                         stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_sent(conn_id, n as u64);
+                    let _ = tx_for_client.try_send(());
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
@@ -678,6 +682,7 @@ async fn relay_data(
                         stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_received(conn_id, n as u64);
+                    let _ = tx_for_target.try_send(());
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
