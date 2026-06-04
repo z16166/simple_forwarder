@@ -19,7 +19,6 @@ use notify::{RecursiveMode, Watcher};
 use proxy_client::ProxyConfig;
 use proxy_server::ProxyServer;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -80,8 +79,6 @@ async fn run_app() -> Result<()> {
 
     log::info!("Starting Simple Forwarder...");
 
-    let (tx, rx) = mpsc::channel::<()>(100);
-
     let initial_rules = parse_rules(&config)?;
     let rules_arc = Arc::new(ArcSwap::from_pointee(initial_rules));
     let rules_for_server = rules_arc.clone();
@@ -98,10 +95,9 @@ async fn run_app() -> Result<()> {
 
     let exe_resolver = etw_resolver::ExeResolver::new(listen_addr.port());
 
-    let tray_manager = tray::TrayManager::new(rx, stats_for_tray, tracker_for_tray)?;
+    let tray_manager = tray::TrayManager::new(stats_for_tray, tracker_for_tray)?;
     let server = ProxyServer::new(
         listen_addr,
-        tx,
         rules_for_server,
         stats_for_server,
         tracker_for_server,

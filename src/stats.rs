@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64}};
 
 pub struct TrafficStats {
     pub listen_addr: String,
@@ -8,6 +7,7 @@ pub struct TrafficStats {
     pub direct_rx: AtomicU64,
     pub direct_tx: AtomicU64,
     pub start_time: std::time::Instant,
+    pub traffic_active: AtomicBool,
 }
 
 impl TrafficStats {
@@ -19,6 +19,7 @@ impl TrafficStats {
             direct_rx: AtomicU64::new(0),
             direct_tx: AtomicU64::new(0),
             start_time: std::time::Instant::now(),
+            traffic_active: AtomicBool::new(false),
         })
     }
 

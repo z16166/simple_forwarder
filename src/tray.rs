@@ -5,7 +5,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
@@ -52,7 +51,6 @@ pub struct TrayManager {
 
 impl TrayManager {
     pub fn new(
-        rx: mpsc::Receiver<()>,
         stats: Arc<TrafficStats>,
         tracker: Arc<ConnectionTracker>,
     ) -> Result<Self> {
@@ -120,61 +118,56 @@ impl TrayManager {
         let thread_id_for_activity = msg_thread_id.clone();
         let _thread_id_for_menu = msg_thread_id.clone();
 
-        let mut rx = rx;
         let quit_id_for_loop = quit_id.clone();
         let open_dir_id_for_loop = open_dir_id.clone();
         let autostart_id_for_loop = autostart_id.clone();
         let stats_id_for_loop = stats_id.clone();
         let traffic_id_for_loop = traffic_id.clone();
 
+        let stats_clone = stats.clone();
         tokio::spawn(async move {
-            let mut last_activity = std::time::Instant::now();
             let mut currently_active = false;
 
             log::debug!("Activity detection task started");
 
             loop {
-                tokio::select! {
-                    res = rx.recv() => {
-                        if res.is_none() {
-                            log::debug!("Activity channel closed");
-                            break;
-                        }
-                        last_activity = std::time::Instant::now();
-                        if !currently_active {
-                            currently_active = true;
-                            log::debug!("Activity detected, switching icon to active");
-                            is_active_clone.store(true, Ordering::Relaxed);
-                            #[cfg(windows)]
-                            {
-                                let tid = thread_id_for_activity.load(Ordering::Acquire);
-                                if tid != 0 {
-                                    unsafe {
-                                        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                        let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
-                                        if let Err(e) = success {
-                                            log::error!("Failed to post active message to main thread: {}", e);
-                                        }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let active = stats_clone.traffic_active.swap(false, Ordering::Relaxed);
+
+                if active {
+                    if !currently_active {
+                        currently_active = true;
+                        log::debug!("Activity detected, switching icon to active");
+                        is_active_clone.store(true, Ordering::Relaxed);
+                        #[cfg(windows)]
+                        {
+                            let tid = thread_id_for_activity.load(Ordering::Acquire);
+                            if tid != 0 {
+                                unsafe {
+                                    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+                                    let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
+                                    if let Err(e) = success {
+                                        log::error!("Failed to post active message to main thread: {}", e);
                                     }
                                 }
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if currently_active && last_activity.elapsed() > Duration::from_secs(1) {
-                            currently_active = false;
-                            log::debug!("Inactivity detected, switching icon to inactive");
-                            is_active_clone.store(false, Ordering::Relaxed);
-                            #[cfg(windows)]
-                            {
-                                let tid = thread_id_for_activity.load(Ordering::Acquire);
-                                if tid != 0 {
-                                    unsafe {
-                                        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                        let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
-                                        if let Err(e) = success {
-                                            log::error!("Failed to post inactive message to main thread: {}", e);
-                                        }
+                } else {
+                    if currently_active {
+                        currently_active = false;
+                        log::debug!("Inactivity detected, switching icon to inactive");
+                        is_active_clone.store(false, Ordering::Relaxed);
+                        #[cfg(windows)]
+                        {
+                            let tid = thread_id_for_activity.load(Ordering::Acquire);
+                            if tid != 0 {
+                                unsafe {
+                                    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+                                    let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+                                    if let Err(e) = success {
+                                        log::error!("Failed to post inactive message to main thread: {}", e);
                                     }
                                 }
                             }
