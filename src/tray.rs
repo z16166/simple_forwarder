@@ -39,6 +39,7 @@ pub struct TrayManager {
     hicon_inactive: windows::Win32::UI::WindowsAndMessaging::HICON,
     autostart_item: CheckMenuItem,
     quit_id: tray_icon::menu::MenuId,
+    open_dir_id: tray_icon::menu::MenuId,
     autostart_id: tray_icon::menu::MenuId,
     stats_id: tray_icon::menu::MenuId,
     traffic_id: tray_icon::menu::MenuId,
@@ -59,6 +60,9 @@ impl TrayManager {
 
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_id = quit_item.id().clone();
+
+        let open_dir_item = MenuItem::new("Open Program Directory", true, None);
+        let open_dir_id = open_dir_item.id().clone();
 
         let autostart_item = CheckMenuItem::new("Run at Startup", true, false, None);
         let autostart_id = autostart_item.id().clone();
@@ -83,6 +87,7 @@ impl TrayManager {
             &stats_item,
             &traffic_item,
             &tray_icon::menu::PredefinedMenuItem::separator(),
+            &open_dir_item,
             &autostart_item,
             &tray_icon::menu::PredefinedMenuItem::separator(),
             &quit_item,
@@ -117,6 +122,7 @@ impl TrayManager {
 
         let mut rx = rx;
         let quit_id_for_loop = quit_id.clone();
+        let open_dir_id_for_loop = open_dir_id.clone();
         let autostart_id_for_loop = autostart_id.clone();
         let stats_id_for_loop = stats_id.clone();
         let traffic_id_for_loop = traffic_id.clone();
@@ -226,6 +232,7 @@ impl TrayManager {
             hicon_inactive,
             autostart_item,
             quit_id: quit_id_for_loop,
+            open_dir_id: open_dir_id_for_loop,
             autostart_id: autostart_id_for_loop,
             stats_id: stats_id_for_loop,
             traffic_id: traffic_id_for_loop,
@@ -343,6 +350,14 @@ impl TrayManager {
                                 }
                                 lock.store(false, Ordering::SeqCst);
                             });
+                        } else if event.id == self.open_dir_id {
+                            if let Ok(exe_path) = std::env::current_exe() {
+                                if let Some(exe_dir) = exe_path.parent() {
+                                    if let Err(e) = open_directory(exe_dir) {
+                                        log::error!("Failed to open program directory: {}", e);
+                                    }
+                                }
+                            }
                         } else if event.id == self.traffic_id {
                             let tracker = self.tracker.clone();
                             let want_visible = self.is_traffic_open.clone();
@@ -443,7 +458,21 @@ impl TrayManager {
         #[cfg(not(windows))]
         {
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    if event.id == self.quit_id {
+                        log::info!("Quit menu selected");
+                        std::process::exit(0);
+                    } else if event.id == self.open_dir_id {
+                        if let Ok(exe_path) = std::env::current_exe() {
+                            if let Some(exe_dir) = exe_path.parent() {
+                                if let Err(e) = open_directory(exe_dir) {
+                                    log::error!("Failed to open program directory: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -699,5 +728,24 @@ impl TrayManager {
             }
         }
         Ok(())
+    }
+}
+
+fn open_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer").arg(dir).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(dir).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(dir).spawn().map(|_| ())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "Unsupported platform"))
     }
 }
