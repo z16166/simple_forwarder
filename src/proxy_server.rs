@@ -165,12 +165,12 @@ async fn handle_connection(
             handle_http(fb, stream, peer_addr, &rules_guard).await
         };
 
-        result.map(|(s, t, h, p, proxy, proto)| (s, t, h, p, proxy, proto))
+        result.map(|(s, t, h, p, proxy, proto, leftover)| (s, t, h, p, proxy, proto, leftover))
     })
     .await;
 
     match res {
-        Ok(Ok((stream, target_stream, host, port, proxy_desc, protocol))) => {
+        Ok(Ok((stream, target_stream, host, port, proxy_desc, protocol, leftover))) => {
             let is_direct = proxy_desc == "direct";
             tracker.set_proxy_protocol(conn_id, protocol);
             tracker.set_outbound_target(conn_id, format!("{}:{}", host, port));
@@ -187,6 +187,7 @@ async fn handle_connection(
                 is_direct,
                 conn_id,
                 tracker,
+                leftover,
             )
             .await;
             exe_resolver.remove(peer_addr.port());
@@ -211,7 +212,7 @@ async fn handle_socks4(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16, String, String)> {
+) -> Result<(TcpStream, TcpStream, String, u16, String, String, bytes::Bytes)> {
     // SOCKS4 header: CMD (1), DSTPORT (2), DSTIP (4)
     let mut header = [0u8; 7];
     stream.read_exact(&mut header).await?;
@@ -285,6 +286,7 @@ async fn handle_socks4(
         port,
         proxy_desc,
         proto.to_string(),
+        bytes::Bytes::new(),
     ))
 }
 
@@ -301,7 +303,7 @@ async fn handle_socks5(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16, String, String)> {
+) -> Result<(TcpStream, TcpStream, String, u16, String, String, bytes::Bytes)> {
     // We already read the first byte (version 0x05)
     let mut second_byte = [0u8; 1];
     stream.read_exact(&mut second_byte).await?;
@@ -392,7 +394,43 @@ async fn handle_socks5(
         port,
         proxy_desc,
         proto.to_string(),
+        bytes::Bytes::new(),
     ))
+}
+
+async fn read_http_headers(stream: &mut TcpStream, first_byte: u8) -> Result<(Vec<u8>, bytes::Bytes)> {
+    let mut buf = bytes::BytesMut::with_capacity(4096);
+    buf.put_u8(first_byte);
+    let mut temp = [0u8; 1024];
+    loop {
+        if let Some(pos) = find_header_separator(&buf) {
+            let headers = buf.split_to(pos).freeze();
+            return Ok((headers.to_vec(), buf.freeze()));
+        }
+        if buf.len() > 16384 {
+            return Err(anyhow::anyhow!("HTTP headers too long"));
+        }
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("Connection closed while reading HTTP headers"));
+        }
+        buf.put_slice(&temp[..n]);
+    }
+}
+
+fn find_header_separator(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 {
+        return None;
+    }
+    for i in 0..buf.len() - 1 {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if i < buf.len() - 3 && buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+            return Some(i + 4);
+        }
+    }
+    None
 }
 
 async fn handle_http(
@@ -400,21 +438,15 @@ async fn handle_http(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: &[(RuleMatcher, ProxyConfig)],
-) -> Result<(TcpStream, TcpStream, String, u16, String, String)> {
-    let mut request_line = vec![first_byte];
-    let mut byte = [0u8; 1];
-    loop {
-        stream.read_exact(&mut byte).await?;
-        request_line.push(byte[0]);
-        if request_line.ends_with(b"\n") {
-            break;
-        }
-        if request_line.len() > 4096 {
-            return Err(anyhow::anyhow!("HTTP request line too long"));
-        }
-    }
+) -> Result<(TcpStream, TcpStream, String, u16, String, String, bytes::Bytes)> {
+    let (header_bytes, leftover) = read_http_headers(&mut stream, first_byte).await?;
 
-    let request_line_str = String::from_utf8_lossy(&request_line).trim().to_string();
+    let first_newline_pos = header_bytes.iter().position(|&b| b == b'\n')
+        .ok_or_else(|| anyhow::anyhow!("Invalid HTTP request headers"))?;
+    let request_line = &header_bytes[..=first_newline_pos];
+    let headers = &header_bytes[first_newline_pos + 1..];
+
+    let request_line_str = String::from_utf8_lossy(request_line).trim().to_string();
     log::debug!("HTTP request line: {}", request_line_str);
 
     let parts: Vec<&str> = request_line_str.split_whitespace().collect();
@@ -473,30 +505,13 @@ async fn handle_http(
         connect_to_target(&host, port, true, None, &rules, &mut stream, false).await?;
 
     if is_connect {
-        // CONNECT request: read headers until empty line (discard them)
-        let mut line = vec![];
-        loop {
-            let mut byte = [0u8; 1];
-            stream.read_exact(&mut byte).await?;
-            line.push(byte[0]);
-            if line.ends_with(b"\r\n\r\n") || line.ends_with(b"\n\n") {
-                break;
-            }
-            if line.len() > 8192 {
-                return Err(anyhow::anyhow!("HTTP CONNECT headers too long"));
-            }
-        }
+        // CONNECT request: send the success response back to the client.
+        // We already consumed the headers, so we just write the status line.
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
     } else {
         // Regular GET/POST request: rewrite the request line to origin-form and forward.
-        //
-        // RFC 7230 §5.3.2 / §5.7.2: browsers talking through an HTTP proxy send the
-        // request-target in absolute-form ("GET http://host/path HTTP/1.1"). When this
-        // proxy forwards the request directly to the origin server it MUST convert that
-        // to origin-form ("GET /path HTTP/1.1"); only an upstream HTTP proxy expects
-        // absolute-form. Sending absolute-form to an origin server causes HTTP 400.
         let rewritten_line: Vec<u8> = if uri.starts_with("http://") || uri.starts_with("https://") {
             // Parse out path+query from the absolute URI and rebuild the request line.
             let origin = if let Ok(parsed) = uri.parse::<http::Uri>() {
@@ -528,7 +543,7 @@ async fn handle_http(
             format!("{method} {origin} {version}\r\n").into_bytes()
         } else {
             // Already origin-form (Edge sends this); forward as-is.
-            request_line.clone()
+            request_line.to_vec()
         };
 
         log::debug!(
@@ -537,20 +552,8 @@ async fn handle_http(
         );
         target_stream.write_all(&rewritten_line).await?;
 
-        // Relay headers until \r\n\r\n
-        let mut header_buf = [0u8; 1];
-        let mut headers = vec![];
-        loop {
-            stream.read_exact(&mut header_buf).await?;
-            headers.push(header_buf[0]);
-            if headers.ends_with(b"\r\n\r\n") || headers.ends_with(b"\n\n") {
-                break;
-            }
-            if headers.len() > 16384 {
-                return Err(anyhow::anyhow!("HTTP headers too long"));
-            }
-        }
-        target_stream.write_all(&headers).await?;
+        // Forward the remaining headers
+        target_stream.write_all(headers).await?;
     }
 
     Ok((
@@ -560,6 +563,7 @@ async fn handle_http(
         port,
         proxy_desc,
         "HTTP".to_string(),
+        leftover,
     ))
 }
 
@@ -629,11 +633,22 @@ async fn relay_data(
     is_direct: bool,
     conn_id: u64,
     tracker: Arc<ConnectionTracker>,
+    leftover: bytes::Bytes,
 ) -> Result<()> {
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
     let client_to_target = async {
+        if !leftover.is_empty() {
+            target_writer.write_all(&leftover).await?;
+            if is_direct {
+                stats.direct_tx.fetch_add(leftover.len() as u64, Ordering::Relaxed);
+            } else {
+                stats.upstream_tx.fetch_add(leftover.len() as u64, Ordering::Relaxed);
+            }
+            tracker.add_bytes_sent(conn_id, leftover.len() as u64);
+            stats.traffic_active.store(true, Ordering::Relaxed);
+        }
         let mut buf = [0u8; 8192];
         loop {
             match timeout(IDLE_TIMEOUT, client_reader.read(&mut buf)).await {

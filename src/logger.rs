@@ -7,13 +7,29 @@ use crate::config::LogConfig;
 
 #[cfg(windows)]
 fn alloc_console() -> Result<()> {
-    use windows::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+    use windows::Win32::System::Console::{AllocConsole, GetConsoleWindow, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL};
+    use windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+    use windows::core::w;
 
     unsafe {
         // In debug builds we usually already have a console. Only allocate one
         // for GUI runs that don't have an attached console yet.
         if GetConsoleWindow().0.is_null() {
             AllocConsole()?;
+            
+            let handle = CreateFileW(
+                w!("CONOUT$"),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )?;
+            
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
         }
     }
     Ok(())

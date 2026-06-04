@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,15 +21,23 @@ pub struct ConnectionInfo {
     closed_at: Option<Instant>,
 }
 
+struct TrackerState {
+    connections: HashMap<u64, ConnectionInfo>,
+    order: VecDeque<u64>,
+}
+
 pub struct ConnectionTracker {
-    connections: Mutex<Vec<ConnectionInfo>>,
+    state: Mutex<TrackerState>,
     next_id: AtomicU64,
 }
 
 impl ConnectionTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            connections: Mutex::new(Vec::new()),
+            state: Mutex::new(TrackerState {
+                connections: HashMap::new(),
+                order: VecDeque::new(),
+            }),
             next_id: AtomicU64::new(1),
         })
     }
@@ -53,93 +62,103 @@ impl ConnectionTracker {
             exe_name: String::new(),
             closed_at: None,
         };
-        let mut connections = self.connections.lock().unwrap();
-        connections.push(info);
-        if connections.len() > MAX_CONNECTIONS {
-            let evicted = connections.remove(0);
-            log::warn!(
-                "Connection tracker full ({}), evicted oldest connection id={} addr={}",
-                MAX_CONNECTIONS,
-                evicted.id,
-                evicted.source_ip,
-            );
+        let mut state = self.state.lock().unwrap();
+        state.connections.insert(id, info);
+        state.order.push_back(id);
+        if state.order.len() > MAX_CONNECTIONS {
+            if let Some(oldest_id) = state.order.pop_front() {
+                if let Some(evicted) = state.connections.remove(&oldest_id) {
+                    log::warn!(
+                        "Connection tracker full ({}), evicted oldest connection id={} addr={}",
+                        MAX_CONNECTIONS,
+                        evicted.id,
+                        evicted.source_ip,
+                    );
+                }
+            }
         }
         id
     }
 
-    fn find(connections: &mut [ConnectionInfo], id: u64) -> Option<&mut ConnectionInfo> {
-        connections.iter_mut().find(|c| c.id == id)
-    }
-
     pub fn set_exe_name(&self, id: u64, exe_name: String) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.exe_name = exe_name;
         }
     }
 
     pub fn set_proxy(&self, id: u64, proxy: String) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.proxy = proxy;
         }
     }
 
     pub fn set_outbound_target(&self, id: u64, target: String) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.outbound_target = target;
         }
     }
 
     pub fn set_proxy_protocol(&self, id: u64, protocol: String) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.proxy_protocol = protocol;
         }
     }
 
     pub fn set_connected(&self, id: u64) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.status = String::from("connected");
         }
     }
 
     pub fn set_closed(&self, id: u64) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.status = String::from("closed");
             conn.closed_at = Some(Instant::now());
         }
     }
 
     pub fn set_error(&self, id: u64, err: &str) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.status = format!("error: {}", err);
             conn.closed_at = Some(Instant::now());
         }
     }
 
     pub fn add_bytes_sent(&self, id: u64, n: u64) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.bytes_sent += n;
         }
     }
 
     pub fn add_bytes_received(&self, id: u64, n: u64) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(conn) = Self::find(&mut connections, id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.connections.get_mut(&id) {
             conn.bytes_received += n;
         }
     }
 
     pub fn snapshot(&self) -> Vec<ConnectionInfo> {
-        let mut connections = self.connections.lock().unwrap();
-        connections.retain(|c| c.closed_at.map_or(true, |t| t.elapsed() < CLOSED_RETENTION));
-        connections.clone()
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        state.connections.retain(|_, c| c.closed_at.map_or(true, |t| t.elapsed() < CLOSED_RETENTION));
+        let active_connections = &state.connections;
+        state.order.retain(|id| active_connections.contains_key(id));
+
+        let mut list = Vec::with_capacity(state.connections.len());
+        for id in &state.order {
+            if let Some(conn) = state.connections.get(id) {
+                list.push(conn.clone());
+            }
+        }
+        list
     }
 }
 
