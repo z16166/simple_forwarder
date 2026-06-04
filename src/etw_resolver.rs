@@ -330,7 +330,12 @@ mod imp {
                         log::debug!("ETW: trace session started successfully");
                         // Keep _t alive so the trace runs for the program lifetime.
                         // The thread will be terminated on process exit (process::exit(0)).
-                        std::thread::park();
+                        // We use a loop here to handle spurious wakeups of std::thread::park().
+                        // Since no other thread calls unpark() on this thread, any wakeup is spurious,
+                        // and wrapping it in a loop prevents the trace handle `_t` from being prematurely dropped.
+                        loop {
+                            std::thread::park();
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(false);
