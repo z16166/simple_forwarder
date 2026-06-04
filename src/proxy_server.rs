@@ -648,6 +648,7 @@ async fn relay_data(
 
     let client_to_target = async {
         let mut buf = [0u8; 8192];
+        let mut last_signal = std::time::Instant::now();
         loop {
             match timeout(IDLE_TIMEOUT, client_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
@@ -659,7 +660,10 @@ async fn relay_data(
                         stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_sent(conn_id, n as u64);
-                    let _ = tx_for_client.try_send(());
+                    if last_signal.elapsed() > Duration::from_millis(200) {
+                        let _ = tx_for_client.try_send(());
+                        last_signal = std::time::Instant::now();
+                    }
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
@@ -671,6 +675,7 @@ async fn relay_data(
 
     let target_to_client = async {
         let mut buf = [0u8; 8192];
+        let mut last_signal = std::time::Instant::now();
         loop {
             match timeout(IDLE_TIMEOUT, target_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
@@ -682,7 +687,10 @@ async fn relay_data(
                         stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_received(conn_id, n as u64);
-                    let _ = tx_for_target.try_send(());
+                    if last_signal.elapsed() > Duration::from_millis(200) {
+                        let _ = tx_for_target.try_send(());
+                        last_signal = std::time::Instant::now();
+                    }
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
