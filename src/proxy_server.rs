@@ -660,8 +660,8 @@ async fn relay_data(
                         stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_sent(conn_id, n as u64);
-                    if last_signal.elapsed() > Duration::from_millis(200) {
-                        let _ = tx_for_client.try_send(());
+                    if last_signal.elapsed() > Duration::from_millis(500) {
+                        notify_activity(&tx_for_client);
                         last_signal = std::time::Instant::now();
                     }
                 }
@@ -687,8 +687,8 @@ async fn relay_data(
                         stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_received(conn_id, n as u64);
-                    if last_signal.elapsed() > Duration::from_millis(200) {
-                        let _ = tx_for_target.try_send(());
+                    if last_signal.elapsed() > Duration::from_millis(500) {
+                        notify_activity(&tx_for_target);
                         last_signal = std::time::Instant::now();
                     }
                 }
@@ -752,4 +752,23 @@ async fn send_success_reply(stream: &mut TcpStream) -> Result<()> {
 
     stream.write_all(&response).await?;
     Ok(())
+}
+
+fn notify_activity(tx: &mpsc::Sender<()>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static LAST_SIGNAL: AtomicU64 = AtomicU64::new(0);
+    if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        let now = duration.as_millis() as u64;
+        let last = LAST_SIGNAL.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > 500 {
+            if LAST_SIGNAL
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let _ = tx.try_send(());
+            }
+        }
+    }
 }
