@@ -132,10 +132,12 @@ pub fn open_traffic_window(
         return; // UI thread already alive
     }
 
+    let thread_running_clone = thread_running.clone();
     std::thread::spawn(move || {
         if let Err(e) = run_traffic_window(tracker, want_visible) {
             log::error!("Traffic window error: {}", e);
         }
+        thread_running_clone.store(false, Ordering::SeqCst);
     });
 }
 
