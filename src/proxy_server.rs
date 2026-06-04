@@ -679,26 +679,62 @@ async fn relay_data(
         Ok(())
     };
 
-    // select! cancels the other direction immediately when one finishes,
-    // preventing stale half-connections from lingering for IDLE_TIMEOUT.
-    tokio::select! {
-        r = client_to_target => {
-            match r {
-                Err(e) => {
-                    tracker.set_error(conn_id, &e.to_string());
-                    log::debug!("Client→Target relay error: {}", e);
+    tokio::pin!(client_to_target);
+    tokio::pin!(target_to_client);
+    let mut client_done = false;
+    let mut target_done = false;
+    let mut linger_timeout = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            r = &mut client_to_target, if !client_done => {
+                client_done = true;
+                match r {
+                    Err(e) => {
+                        tracker.set_error(conn_id, &e.to_string());
+                        log::debug!("Client→Target relay error: {}", e);
+                        break;
+                    }
+                    Ok(()) => {
+                        if !target_done {
+                            linger_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                        }
+                    }
                 }
-                Ok(()) => tracker.set_closed(conn_id),
+            }
+            r = &mut target_to_client, if !target_done => {
+                target_done = true;
+                match r {
+                    Err(e) => {
+                        tracker.set_error(conn_id, &e.to_string());
+                        log::debug!("Target→Client relay error: {}", e);
+                        break;
+                    }
+                    Ok(()) => {
+                        if !client_done {
+                            linger_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                        }
+                    }
+                }
+            }
+            _ = async {
+                if let Some(sleep) = linger_timeout.as_mut() {
+                    sleep.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if linger_timeout.is_some() => {
+                log::debug!("Linger timeout reached for connection {}, shutting down", conn_id);
+                tracker.set_closed(conn_id);
+                break;
             }
         }
-        r = target_to_client => {
-            match r {
-                Err(e) => {
-                    tracker.set_error(conn_id, &e.to_string());
-                    log::debug!("Target→Client relay error: {}", e);
-                }
-                Ok(()) => tracker.set_closed(conn_id),
-            }
+
+        if client_done && target_done {
+            tracker.set_closed(conn_id);
+            break;
         }
     }
     // Remaining stream halves are dropped here, closing both connections

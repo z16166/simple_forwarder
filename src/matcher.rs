@@ -41,16 +41,17 @@ impl RuleMatcher {
     fn parse_pattern(pattern: String) -> Option<Pattern> {
         if pattern.contains('/') {
             pattern.parse::<IpNet>().ok().map(Pattern::Cidr)
-        } else if pattern.parse::<IpAddr>().is_ok() {
-            pattern.parse::<IpAddr>().ok().map(Pattern::Ip)
+        } else if let Ok(ip) = pattern.parse::<IpAddr>() {
+            Some(Pattern::Ip(ip))
         } else {
             Some(Pattern::Domain(WildMatch::new(&pattern)))
         }
     }
 
     pub fn matches(&self, host: &str, ip: Option<IpAddr>) -> bool {
+        let resolved_ip = ip.or_else(|| host.parse::<IpAddr>().ok());
         for pattern in &self.patterns {
-            if self.match_pattern(pattern, host, ip) {
+            if self.match_pattern(pattern, host, resolved_ip) {
                 return true;
             }
         }
@@ -81,6 +82,20 @@ impl RuleMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_domain_ip_matching_without_ip_param() {
+        // Test that an IP pattern matches when the IP address is passed as the host string
+        // but the ip parameter is None (simulating SOCKS5 atyp=0x03 requests).
+        let matcher = RuleMatcher::new(vec!["192.168.1.1".to_string()]);
+        assert!(matcher.matches("192.168.1.1", None));
+        assert!(!matcher.matches("192.168.1.2", None));
+
+        // Test that a CIDR pattern matches when the IP is passed as the host string.
+        let matcher_cidr = RuleMatcher::new(vec!["192.168.1.0/24".to_string()]);
+        assert!(matcher_cidr.matches("192.168.1.5", None));
+        assert!(!matcher_cidr.matches("192.168.2.5", None));
+    }
 
     #[test]
     fn test_domain_wildcard() {

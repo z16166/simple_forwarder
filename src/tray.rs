@@ -109,14 +109,12 @@ impl TrayManager {
             .build()?;
 
         let menu_clone = menu.clone();
-        let _menu_channel = MenuEvent::receiver();
 
         let is_active_clone = is_active.clone();
 
         // Thread ID will be set when run_message_loop() starts on the actual message loop thread.
         let msg_thread_id = Arc::new(AtomicU32::new(0));
         let thread_id_for_activity = msg_thread_id.clone();
-        let _thread_id_for_menu = msg_thread_id.clone();
 
         let quit_id_for_loop = quit_id.clone();
         let open_dir_id_for_loop = open_dir_id.clone();
