@@ -110,12 +110,14 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use std::time::{Duration, Instant};
+
     #[derive(Clone)]
     pub struct ExeResolver {
         /// PID source: populated by ETW callback (cheap, no syscalls).
-        port_to_pid: Arc<Mutex<HashMap<u16, u32>>>,
+        port_to_pid: Arc<Mutex<HashMap<u16, (u32, Instant)>>>,
         /// Resolved exe name cache.
-        port_to_exe: Arc<Mutex<HashMap<u16, String>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, (String, Instant)>>>,
         listen_port: u16,
     }
 
@@ -144,20 +146,31 @@ mod imp {
         /// Tokio worker thread pool.
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
             // Fast path: already-resolved cache.
-            if let Some(exe) = self.port_to_exe.lock().get(&remote_port).cloned() {
+            if let Some((exe, _)) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
             // ETW-provided PID — resolve in spawn_blocking.
             // Guard must be dropped before the await point.
-            let etw_pid = self.port_to_pid.lock().get(&remote_port).copied();
+            let etw_pid = self
+                .port_to_pid
+                .lock()
+                .get(&remote_port)
+                .map(|(pid, _)| *pid);
             if let Some(pid) = etw_pid {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
                 let pid_map = self.port_to_pid.lock();
-                if pid_map.get(&remote_port).copied() == Some(pid) {
-                    self.port_to_exe.lock().insert(remote_port, exe.clone());
+                if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
+                    let mut exe_map = self.port_to_exe.lock();
+                    exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                    if exe_map.len() > 1000 {
+                        let now = Instant::now();
+                        exe_map.retain(|_, (_, time)| {
+                            now.duration_since(*time) < Duration::from_secs(30)
+                        });
+                    }
                 }
                 return Some(exe);
             }
@@ -171,14 +184,28 @@ mod imp {
             .ok()??;
 
             // Cache the PID so future lookups on this port avoid another scan.
-            self.port_to_pid.lock().insert(remote_port, result);
+            {
+                let mut pid_map = self.port_to_pid.lock();
+                pid_map.insert(remote_port, (result, Instant::now()));
+                if pid_map.len() > 1000 {
+                    let now = Instant::now();
+                    pid_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
+            }
 
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
             let pid_map = self.port_to_pid.lock();
-            if pid_map.get(&remote_port).copied() == Some(result) {
-                self.port_to_exe.lock().insert(remote_port, exe.clone());
+            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(result) {
+                let mut exe_map = self.port_to_exe.lock();
+                exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                if exe_map.len() > 1000 {
+                    let now = Instant::now();
+                    exe_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
             }
             Some(exe)
         }
@@ -207,8 +234,8 @@ mod imp {
     /// `process_id()` on the record gives the PID of the connecting process.
     fn try_start_etw(
         listen_port: u16,
-        port_to_pid: Arc<Mutex<HashMap<u16, u32>>>,
-        port_to_exe: Arc<Mutex<HashMap<u16, String>>>,
+        port_to_pid: Arc<Mutex<HashMap<u16, (u32, std::time::Instant)>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, (String, std::time::Instant)>>>,
     ) -> bool {
         use std::time::Duration;
 
@@ -273,8 +300,19 @@ mod imp {
 
                             let mut pid_map = port_to_pid.lock();
                             let mut exe_map = port_to_exe.lock();
-                            pid_map.insert(sport, pid);
+                            let now = std::time::Instant::now();
+                            pid_map.insert(sport, (pid, now));
                             exe_map.remove(&sport);
+                            if pid_map.len() > 1000 {
+                                pid_map.retain(|_, (_, time)| {
+                                    now.duration_since(*time) < std::time::Duration::from_secs(30)
+                                });
+                            }
+                            if exe_map.len() > 1000 {
+                                exe_map.retain(|_, (_, time)| {
+                                    now.duration_since(*time) < std::time::Duration::from_secs(30)
+                                });
+                            }
                             log::debug!("ETW: captured pid={}, sport={}", pid, sport);
                             drop(pid_map);
                             drop(exe_map);
@@ -405,11 +443,12 @@ mod imp {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[derive(Clone)]
     pub struct ExeResolver {
-        port_to_pid: Arc<Mutex<HashMap<u16, u32>>>,
-        port_to_exe: Arc<Mutex<HashMap<u16, String>>>,
+        port_to_pid: Arc<Mutex<HashMap<u16, (u32, Instant)>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, (String, Instant)>>>,
         listen_port: u16,
     }
 
@@ -423,18 +462,29 @@ mod imp {
         }
 
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
-            if let Some(exe) = self.port_to_exe.lock().get(&remote_port).cloned() {
+            if let Some((exe, _)) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
-            let cached_pid = self.port_to_pid.lock().get(&remote_port).copied();
+            let cached_pid = self
+                .port_to_pid
+                .lock()
+                .get(&remote_port)
+                .map(|(pid, _)| *pid);
             if let Some(pid) = cached_pid {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
-                let mut pid_map = self.port_to_pid.lock();
-                if pid_map.get(&remote_port).copied() == Some(pid) {
-                    self.port_to_exe.lock().insert(remote_port, exe.clone());
+                let pid_map = self.port_to_pid.lock();
+                if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
+                    let mut exe_map = self.port_to_exe.lock();
+                    exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                    if exe_map.len() > 1000 {
+                        let now = Instant::now();
+                        exe_map.retain(|_, (_, time)| {
+                            now.duration_since(*time) < Duration::from_secs(30)
+                        });
+                    }
                 }
                 return Some(exe);
             }
@@ -446,14 +496,28 @@ mod imp {
             .await
             .ok()??;
 
-            self.port_to_pid.lock().insert(remote_port, result);
+            {
+                let mut pid_map = self.port_to_pid.lock();
+                pid_map.insert(remote_port, (result, Instant::now()));
+                if pid_map.len() > 1000 {
+                    let now = Instant::now();
+                    pid_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
+            }
 
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
-            let mut pid_map = self.port_to_pid.lock();
-            if pid_map.get(&remote_port).copied() == Some(result) {
-                self.port_to_exe.lock().insert(remote_port, exe.clone());
+            let pid_map = self.port_to_pid.lock();
+            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(result) {
+                let mut exe_map = self.port_to_exe.lock();
+                exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                if exe_map.len() > 1000 {
+                    let now = Instant::now();
+                    exe_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
             }
             Some(exe)
         }
