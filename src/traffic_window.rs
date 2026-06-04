@@ -14,12 +14,22 @@ use crate::connection_tracker::ConnectionTracker;
 use crate::stats::TrafficStats;
 
 // Dark forest-green highlight color (#1A8C1A — readable on white backgrounds).
-const HIGHLIGHT: TableValue = TableValue::Color { r: 0.10, g: 0.55, b: 0.10, a: 1.0 };
+const HIGHLIGHT: TableValue = TableValue::Color {
+    r: 0.10,
+    g: 0.55,
+    b: 0.10,
+    a: 1.0,
+};
 // Opaque black — used as the "no highlight" fallback.
 // NOTE: alpha=0.0 does NOT mean "use system default" in libui-ng on Windows;
 //       it renders the text fully transparent (invisible on a white background).
 //       We must return an explicit opaque color instead.
-const DEFAULT_COLOR: TableValue = TableValue::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+const DEFAULT_COLOR: TableValue = TableValue::Color {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 1.0,
+};
 
 const TOP_N: usize = 5;
 /// Minimum bytes to qualify for the top-5 highlight (10 MiB).
@@ -48,20 +58,20 @@ impl TrafficDataSource {
         let mut by_sent: Vec<(u64, u64)> = self
             .connections
             .iter()
-            .filter(|c| c.bytes_sent > HIGHLIGHT_MIN_BYTES)
-            .map(|c| (c.id, c.bytes_sent))
+            .filter(|c| c.bytes_sent.load(Ordering::Relaxed) > HIGHLIGHT_MIN_BYTES)
+            .map(|c| (c.id, c.bytes_sent.load(Ordering::Relaxed)))
             .collect();
-        by_sent.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_sent.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
         self.top_sent = by_sent.iter().take(TOP_N).map(|&(id, _)| id).collect();
 
         // Top-N by bytes_received where bytes_received > HIGHLIGHT_MIN_BYTES.
         let mut by_recv: Vec<(u64, u64)> = self
             .connections
             .iter()
-            .filter(|c| c.bytes_received > HIGHLIGHT_MIN_BYTES)
-            .map(|c| (c.id, c.bytes_received))
+            .filter(|c| c.bytes_received.load(Ordering::Relaxed) > HIGHLIGHT_MIN_BYTES)
+            .map(|c| (c.id, c.bytes_received.load(Ordering::Relaxed)))
             .collect();
-        by_recv.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_recv.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
         self.top_recv = by_recv.iter().take(TOP_N).map(|&(id, _)| id).collect();
     }
 }
@@ -99,14 +109,26 @@ impl TableDataSource for TrafficDataSource {
             4 => TableValue::String(conn.proxy.clone()),
             5 => TableValue::String(conn.start_time.clone()),
             6 => TableValue::String(conn.status.clone()),
-            COL_BYTES_SENT => TableValue::String(TrafficStats::format_bytes(conn.bytes_sent)),
-            COL_BYTES_RECV => TableValue::String(TrafficStats::format_bytes(conn.bytes_received)),
+            COL_BYTES_SENT => TableValue::String(TrafficStats::format_bytes(
+                conn.bytes_sent.load(Ordering::Relaxed),
+            )),
+            COL_BYTES_RECV => TableValue::String(TrafficStats::format_bytes(
+                conn.bytes_received.load(Ordering::Relaxed),
+            )),
             // Hidden color columns: return highlight color for top-N, default otherwise.
             COL_COLOR_SENT => {
-                if self.top_sent.contains(&conn.id) { HIGHLIGHT } else { DEFAULT_COLOR }
+                if self.top_sent.contains(&conn.id) {
+                    HIGHLIGHT
+                } else {
+                    DEFAULT_COLOR
+                }
             }
             COL_COLOR_RECV => {
-                if self.top_recv.contains(&conn.id) { HIGHLIGHT } else { DEFAULT_COLOR }
+                if self.top_recv.contains(&conn.id) {
+                    HIGHLIGHT
+                } else {
+                    DEFAULT_COLOR
+                }
             }
             _ => TableValue::String(String::new()),
         }
@@ -181,13 +203,17 @@ fn run_traffic_window(
         "Sent",
         COL_BYTES_SENT,
         Table::COLUMN_READONLY,
-        TextColumnParameters { text_color_column: COL_COLOR_SENT },
+        TextColumnParameters {
+            text_color_column: COL_COLOR_SENT,
+        },
     );
     table.append_text_column_with_params(
         "Received",
         COL_BYTES_RECV,
         Table::COLUMN_READONLY,
-        TextColumnParameters { text_color_column: COL_COLOR_RECV },
+        TextColumnParameters {
+            text_color_column: COL_COLOR_RECV,
+        },
     );
     table.set_column_width(0, 200); // Source
     table.set_column_width(1, 260); // Outbound Target
@@ -284,7 +310,9 @@ fn run_traffic_window(
 
                     if resizing {
                         let snapshot = trk.snapshot();
-                        ds.borrow_mut().connections = snapshot;
+                        let mut ds_borrow = ds.borrow_mut();
+                        ds_borrow.connections = snapshot;
+                        ds_borrow.recompute_highlights();
                         return;
                     }
                 }
@@ -379,8 +407,8 @@ fn run_traffic_window(
         for (new_idx, conn) in ds_mut.connections.iter().enumerate() {
             if let Some(&old_idx) = old_idx_by_id.get(&conn.id) {
                 let data_changed = old_connections[old_idx] != *conn;
-                let rank_changed =
-                    old_top_sent.contains(&conn.id) != new_top_sent.contains(&conn.id)
+                let rank_changed = old_top_sent.contains(&conn.id)
+                    != new_top_sent.contains(&conn.id)
                     || old_top_recv.contains(&conn.id) != new_top_recv.contains(&conn.id);
                 if data_changed || rank_changed {
                     model.notify_row_changed(new_idx as i32);
@@ -449,7 +477,7 @@ fn set_window_icon(window: &Window) {
     };
 
     // Resource ID 1 is the main icon embedded by winres
-    let hicon = match unsafe { LoadIconW(hinstance, PCWSTR(1_usize as *const u16)) } {
+    let hicon = match unsafe { LoadIconW(hinstance, PCWSTR(std::ptr::dangling::<u16>())) } {
         Ok(h) => h,
         Err(_) => return,
     };

@@ -106,9 +106,9 @@ mod netstat_fallback {
 
 #[cfg(windows)]
 mod imp {
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use parking_lot::Mutex;
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -125,7 +125,8 @@ mod imp {
             let port_to_exe = Arc::new(Mutex::new(HashMap::new()));
 
             let pid_map = port_to_pid.clone();
-            if !try_start_etw(listen_port, pid_map) {
+            let exe_map = port_to_exe.clone();
+            if !try_start_etw(listen_port, pid_map, exe_map) {
                 log::warn!("ETW unavailable, using netstat2 fallback for exe resolution");
             }
 
@@ -154,9 +155,10 @@ mod imp {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
-                self.port_to_exe
-                    .lock()
-                    .insert(remote_port, exe.clone());
+                let pid_map = self.port_to_pid.lock();
+                if pid_map.get(&remote_port).copied() == Some(pid) {
+                    self.port_to_exe.lock().insert(remote_port, exe.clone());
+                }
                 return Some(exe);
             }
 
@@ -174,9 +176,10 @@ mod imp {
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
-            self.port_to_exe
-                .lock()
-                .insert(remote_port, exe.clone());
+            let pid_map = self.port_to_pid.lock();
+            if pid_map.get(&remote_port).copied() == Some(result) {
+                self.port_to_exe.lock().insert(remote_port, exe.clone());
+            }
             Some(exe)
         }
 
@@ -184,6 +187,10 @@ mod imp {
         pub fn remove(&self, port: u16) {
             self.port_to_pid.lock().remove(&port);
             self.port_to_exe.lock().remove(&port);
+        }
+
+        pub fn cleanup(&self) {
+            etw_cleanup::stop_session_if_exists("SimpleFwd-NetTrace");
         }
     }
 
@@ -196,8 +203,13 @@ mod imp {
     /// is established. Fields used:
     ///   - `dport` (u16): destination port (== our listen port for inbound connections)
     ///   - `sport` (u16): source port of the connecting client process
+    ///
     /// `process_id()` on the record gives the PID of the connecting process.
-    fn try_start_etw(listen_port: u16, port_to_pid: Arc<Mutex<HashMap<u16, u32>>>) -> bool {
+    fn try_start_etw(
+        listen_port: u16,
+        port_to_pid: Arc<Mutex<HashMap<u16, u32>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, String>>>,
+    ) -> bool {
         use std::time::Duration;
 
         use ferrisetw::EventRecord;
@@ -259,15 +271,13 @@ mod imp {
                                 return;
                             }
 
-                            // Store only the PID — cheap, no syscalls.
-                            // Exe name resolution is deferred to `lookup()`
-                            // so we never block the ETW consumer thread.
-                            let mut map = port_to_pid.lock();
-                            if !map.contains_key(&sport) {
-                                map.insert(sport, pid);
-                                log::debug!("ETW: captured pid={}, sport={}", pid, sport);
-                            }
-                            drop(map);
+                            let mut pid_map = port_to_pid.lock();
+                            let mut exe_map = port_to_exe.lock();
+                            pid_map.insert(sport, pid);
+                            exe_map.remove(&sport);
+                            log::debug!("ETW: captured pid={}, sport={}", pid, sport);
+                            drop(pid_map);
+                            drop(exe_map);
                         },
                     )
                     .build();
@@ -331,13 +341,17 @@ mod imp {
                 return false;
             }
 
-            let mut tp = TOKEN_PRIVILEGES::default();
-            tp.PrivilegeCount = 1;
+            let mut tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                ..Default::default()
+            };
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
             let ret = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
-            let _ = CloseHandle(token);
+            if let Err(e) = CloseHandle(token) {
+                log::warn!("ETW: CloseHandle failed: {:?}", e);
+            }
 
             if ret.is_err() {
                 log::debug!("ETW: AdjustTokenPrivileges failed: {:?}", ret);
@@ -388,9 +402,9 @@ pub use imp::ExeResolver;
 
 #[cfg(not(windows))]
 mod imp {
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use parking_lot::Mutex;
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -418,9 +432,10 @@ mod imp {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
-                self.port_to_exe
-                    .lock()
-                    .insert(remote_port, exe.clone());
+                let mut pid_map = self.port_to_pid.lock();
+                if pid_map.get(&remote_port).copied() == Some(pid) {
+                    self.port_to_exe.lock().insert(remote_port, exe.clone());
+                }
                 return Some(exe);
             }
 
@@ -436,9 +451,10 @@ mod imp {
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
-            self.port_to_exe
-                .lock()
-                .insert(remote_port, exe.clone());
+            let mut pid_map = self.port_to_pid.lock();
+            if pid_map.get(&remote_port).copied() == Some(result) {
+                self.port_to_exe.lock().insert(remote_port, exe.clone());
+            }
             Some(exe)
         }
 
@@ -446,6 +462,8 @@ mod imp {
             self.port_to_pid.lock().remove(&port);
             self.port_to_exe.lock().remove(&port);
         }
+
+        pub fn cleanup(&self) {}
     }
 }
 

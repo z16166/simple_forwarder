@@ -90,3 +90,62 @@ impl Config {
         Ok(SocketAddr::new(addr, self.listen.port))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_parsing() {
+        let yaml = r#"
+log:
+  log_type: console
+  level: info
+
+listen:
+  addr: "127.0.0.1"
+  port: 1080
+
+rules:
+  - match_patterns:
+      - "*.google.com"
+    forward_to: "socks5://127.0.0.1:1080"
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config.log.log_type, LogType::Console));
+        assert_eq!(config.log.level, "info");
+        assert_eq!(config.log.flush_interval_secs, 5); // default
+        assert_eq!(config.log.flush_count, 100); // default
+
+        assert_eq!(config.listen.addr, "127.0.0.1");
+        assert_eq!(config.listen.port, 1080);
+        assert_eq!(
+            config.get_listen_addr().unwrap(),
+            "127.0.0.1:1080".parse::<SocketAddr>().unwrap()
+        );
+
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].match_patterns[0], "*.google.com");
+        assert_eq!(config.rules[0].forward_to, "socks5://127.0.0.1:1080");
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let yaml = r#"
+log:
+  file: "app.log"
+
+listen:
+  port: 8080
+
+rules: []
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config.log.log_type, LogType::None)); // default
+        assert_eq!(config.log.level, "warn"); // default
+        assert_eq!(config.listen.addr, "127.0.0.1"); // default
+        assert_eq!(config.listen.port, 8080);
+    }
+}

@@ -50,10 +50,7 @@ pub struct TrayManager {
 }
 
 impl TrayManager {
-    pub fn new(
-        stats: Arc<TrafficStats>,
-        tracker: Arc<ConnectionTracker>,
-    ) -> Result<Self> {
+    pub fn new(stats: Arc<TrafficStats>, tracker: Arc<ConnectionTracker>) -> Result<Self> {
         let is_active = Arc::new(AtomicBool::new(false));
 
         let quit_item = MenuItem::new("Quit", true, None);
@@ -73,10 +70,10 @@ impl TrayManager {
 
         #[cfg(windows)]
         {
-            if let Ok(path) = Self::get_quoted_exe_path() {
-                if Self::check_autostart_status(&path) {
-                    autostart_item.set_checked(true);
-                }
+            if let Ok(path) = Self::get_quoted_exe_path()
+                && Self::check_autostart_status(&path)
+            {
+                autostart_item.set_checked(true);
             }
         }
 
@@ -143,10 +140,20 @@ impl TrayManager {
                             let tid = thread_id_for_activity.load(Ordering::Acquire);
                             if tid != 0 {
                                 unsafe {
-                                    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                    let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(1), windows::Win32::Foundation::LPARAM(0));
+                                    use windows::Win32::UI::WindowsAndMessaging::{
+                                        PostThreadMessageW, WM_USER,
+                                    };
+                                    let success = PostThreadMessageW(
+                                        tid,
+                                        WM_USER + 1,
+                                        windows::Win32::Foundation::WPARAM(1),
+                                        windows::Win32::Foundation::LPARAM(0),
+                                    );
                                     if let Err(e) = success {
-                                        log::error!("Failed to post active message to main thread: {}", e);
+                                        log::error!(
+                                            "Failed to post active message to main thread: {}",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -162,10 +169,20 @@ impl TrayManager {
                             let tid = thread_id_for_activity.load(Ordering::Acquire);
                             if tid != 0 {
                                 unsafe {
-                                    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
-                                    let success = PostThreadMessageW(tid, WM_USER + 1, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+                                    use windows::Win32::UI::WindowsAndMessaging::{
+                                        PostThreadMessageW, WM_USER,
+                                    };
+                                    let success = PostThreadMessageW(
+                                        tid,
+                                        WM_USER + 1,
+                                        windows::Win32::Foundation::WPARAM(0),
+                                        windows::Win32::Foundation::LPARAM(0),
+                                    );
                                     if let Err(e) = success {
-                                        log::error!("Failed to post inactive message to main thread: {}", e);
+                                        log::error!(
+                                            "Failed to post inactive message to main thread: {}",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -181,9 +198,9 @@ impl TrayManager {
             let mut last_update = std::time::Instant::now();
             while let Ok(event) = tray_event_channel.recv() {
                 match event {
-                    TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. } => {
+                    TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. }
                         // Throttle updates to at most once per 200ms to avoid flooding
-                        if last_update.elapsed() > Duration::from_millis(200) {
+                        if last_update.elapsed() > Duration::from_millis(200) => {
                             #[cfg(windows)]
                             {
                                 let tid = tid_for_events.load(Ordering::Acquire);
@@ -204,7 +221,6 @@ impl TrayManager {
                             }
                             last_update = std::time::Instant::now();
                         }
-                    }
                     _ => {}
                 }
             }
@@ -276,12 +292,12 @@ impl TrayManager {
                         } else if event.id == self.autostart_id {
                             let is_checked = self.autostart_item.is_checked();
                             log::info!("Toggle Run at Startup: {}", is_checked);
-                            if let Ok(path) = Self::get_quoted_exe_path() {
-                                if let Err(e) = Self::set_autostart(&path, is_checked) {
-                                    log::error!("Failed to update autostart registry: {}", e);
-                                    // Revert checkbox on failure
-                                    self.autostart_item.set_checked(!is_checked);
-                                }
+                            if let Ok(path) = Self::get_quoted_exe_path()
+                                && let Err(e) = Self::set_autostart(&path, is_checked)
+                            {
+                                log::error!("Failed to update autostart registry: {}", e);
+                                // Revert checkbox on failure
+                                self.autostart_item.set_checked(!is_checked);
                             }
                         } else if event.id == self.stats_id {
                             let lock = self.is_dialog_open.clone();
@@ -342,12 +358,11 @@ impl TrayManager {
                                 lock.store(false, Ordering::SeqCst);
                             });
                         } else if event.id == self.open_dir_id {
-                            if let Ok(exe_path) = std::env::current_exe() {
-                                if let Some(exe_dir) = exe_path.parent() {
-                                    if let Err(e) = open_directory(exe_dir) {
-                                        log::error!("Failed to open program directory: {}", e);
-                                    }
-                                }
+                            if let Ok(exe_path) = std::env::current_exe()
+                                && let Some(exe_dir) = exe_path.parent()
+                                && let Err(e) = open_directory(exe_dir)
+                            {
+                                log::error!("Failed to open program directory: {}", e);
                             }
                         } else if event.id == self.traffic_id {
                             let tracker = self.tracker.clone();
@@ -566,7 +581,7 @@ impl TrayManager {
         let bytes = s.as_bytes();
         let len = bytes.len();
         for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (len - i) % 3 == 0 {
+            if i > 0 && (len - i).is_multiple_of(3) {
                 result.push(',');
             }
             result.push(b as char);
@@ -725,18 +740,30 @@ impl TrayManager {
 fn open_directory(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer").arg(dir).spawn().map(|_| ())
+        std::process::Command::new("explorer")
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(dir).spawn().map(|_| ())
+        std::process::Command::new("open")
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(dir).spawn().map(|_| ())
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "Unsupported platform"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Unsupported platform",
+        ))
     }
 }
