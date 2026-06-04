@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.50", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_yaml = "0.9.34"
+serde_yaml = { package = "yaml_serde", version = "0.10" }
 wildmatch = "2.6.1"
 ipnet = "2.11.0"
 tray-icon = "0.14.3"
@@ -24,6 +24,7 @@ libui = "0.4"
 libui-ffi = "0.4.0"
 
 netstat2 = "0.11"
+parking_lot = "0.12.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_System_Threading", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_Etw", "Win32_Security"] }

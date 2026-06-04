@@ -101,7 +101,7 @@ async fn run_app() -> Result<()> {
         rules_for_server,
         stats_for_server,
         tracker_for_server,
-        exe_resolver,
+        exe_resolver.clone(),
     )
     .await?;
 
@@ -112,10 +112,10 @@ async fn run_app() -> Result<()> {
     let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            if event.kind.is_modify() {
-                let _ = watch_tx.blocking_send(());
-            }
+        if let Ok(event) = res
+            && event.kind.is_modify()
+        {
+            let _ = watch_tx.blocking_send(());
         }
     })?;
 
@@ -124,7 +124,7 @@ async fn run_app() -> Result<()> {
     tokio::spawn(async move {
         // Keep watcher alive
         let _watcher = watcher;
-        while let Some(_) = watch_rx.recv().await {
+        while watch_rx.recv().await.is_some() {
             log::info!("Config file changed, reloading...");
             // Small delay to ensure file is completely written
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -158,6 +158,8 @@ async fn run_app() -> Result<()> {
     // would otherwise keep the process—and its console window—alive indefinitely.
     // Force a clean exit so everything (including the console) is released immediately.
     log::info!("Shutting down.");
+    log::logger().flush();
+    exe_resolver.cleanup();
     std::process::exit(0);
 }
 

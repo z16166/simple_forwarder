@@ -7,13 +7,52 @@ use crate::config::LogConfig;
 
 #[cfg(windows)]
 fn alloc_console() -> Result<()> {
-    use windows::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+    use windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        AllocConsole, FreeConsole, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    use windows::core::w;
 
     unsafe {
         // In debug builds we usually already have a console. Only allocate one
         // for GUI runs that don't have an attached console yet.
         if GetConsoleWindow().0.is_null() {
             AllocConsole()?;
+
+            let handle = match CreateFileW(
+                w!("CONOUT$"),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = FreeConsole();
+                    return Err(e.into());
+                }
+            };
+
+            // Only redirect standard handles if they are currently invalid or null
+            let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE)?;
+            if (stdout_handle.is_invalid() || stdout_handle.0.is_null())
+                && let Err(e) = SetStdHandle(STD_OUTPUT_HANDLE, handle)
+            {
+                eprintln!("AllocConsole: failed to set STD_OUTPUT_HANDLE: {:?}", e);
+            }
+
+            let stderr_handle = GetStdHandle(STD_ERROR_HANDLE)?;
+            if (stderr_handle.is_invalid() || stderr_handle.0.is_null())
+                && let Err(e) = SetStdHandle(STD_ERROR_HANDLE, handle)
+            {
+                eprintln!("AllocConsole: failed to set STD_ERROR_HANDLE: {:?}", e);
+            }
         }
     }
     Ok(())
@@ -70,8 +109,7 @@ impl Write for FlushingWriter {
 pub fn setup_logger(config: &LogConfig) -> Result<()> {
     let env = env_logger::Env::default().filter_or("RUST_LOG", &config.level);
 
-    let builder = env_logger::Builder::from_env(env);
-    let mut builder = builder;
+    let mut builder = env_logger::Builder::from_env(env);
 
     builder.format(|buf, record| {
         use std::io::Write;

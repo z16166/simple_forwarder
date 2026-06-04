@@ -106,15 +106,18 @@ mod netstat_fallback {
 
 #[cfg(windows)]
 mod imp {
+    use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+
+    use std::time::{Duration, Instant};
 
     #[derive(Clone)]
     pub struct ExeResolver {
         /// PID source: populated by ETW callback (cheap, no syscalls).
-        port_to_pid: Arc<Mutex<HashMap<u16, u32>>>,
+        port_to_pid: Arc<Mutex<HashMap<u16, (u32, Instant)>>>,
         /// Resolved exe name cache.
-        port_to_exe: Arc<Mutex<HashMap<u16, String>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, (String, Instant)>>>,
         listen_port: u16,
     }
 
@@ -124,7 +127,8 @@ mod imp {
             let port_to_exe = Arc::new(Mutex::new(HashMap::new()));
 
             let pid_map = port_to_pid.clone();
-            if !try_start_etw(listen_port, pid_map) {
+            let exe_map = port_to_exe.clone();
+            if !try_start_etw(listen_port, pid_map, exe_map) {
                 log::warn!("ETW unavailable, using netstat2 fallback for exe resolution");
             }
 
@@ -142,21 +146,32 @@ mod imp {
         /// Tokio worker thread pool.
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
             // Fast path: already-resolved cache.
-            if let Some(exe) = self.port_to_exe.lock().unwrap().get(&remote_port).cloned() {
+            if let Some((exe, _)) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
             // ETW-provided PID — resolve in spawn_blocking.
             // Guard must be dropped before the await point.
-            let etw_pid = self.port_to_pid.lock().unwrap().get(&remote_port).copied();
+            let etw_pid = self
+                .port_to_pid
+                .lock()
+                .get(&remote_port)
+                .map(|(pid, _)| *pid);
             if let Some(pid) = etw_pid {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
-                self.port_to_exe
-                    .lock()
-                    .unwrap()
-                    .insert(remote_port, exe.clone());
+                let pid_map = self.port_to_pid.lock();
+                if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
+                    let mut exe_map = self.port_to_exe.lock();
+                    exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                    if exe_map.len() > 1000 {
+                        let now = Instant::now();
+                        exe_map.retain(|_, (_, time)| {
+                            now.duration_since(*time) < Duration::from_secs(30)
+                        });
+                    }
+                }
                 return Some(exe);
             }
 
@@ -169,22 +184,40 @@ mod imp {
             .ok()??;
 
             // Cache the PID so future lookups on this port avoid another scan.
-            self.port_to_pid.lock().unwrap().insert(remote_port, result);
+            {
+                let mut pid_map = self.port_to_pid.lock();
+                pid_map.insert(remote_port, (result, Instant::now()));
+                if pid_map.len() > 1000 {
+                    let now = Instant::now();
+                    pid_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
+            }
 
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
-            self.port_to_exe
-                .lock()
-                .unwrap()
-                .insert(remote_port, exe.clone());
+            let pid_map = self.port_to_pid.lock();
+            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(result) {
+                let mut exe_map = self.port_to_exe.lock();
+                exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                if exe_map.len() > 1000 {
+                    let now = Instant::now();
+                    exe_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
+            }
             Some(exe)
         }
 
         /// Evict cached entries for a port that is no longer in use.
         pub fn remove(&self, port: u16) {
-            self.port_to_pid.lock().unwrap().remove(&port);
-            self.port_to_exe.lock().unwrap().remove(&port);
+            self.port_to_pid.lock().remove(&port);
+            self.port_to_exe.lock().remove(&port);
+        }
+
+        pub fn cleanup(&self) {
+            etw_cleanup::stop_session_if_exists("SimpleFwd-NetTrace");
         }
     }
 
@@ -197,8 +230,13 @@ mod imp {
     /// is established. Fields used:
     ///   - `dport` (u16): destination port (== our listen port for inbound connections)
     ///   - `sport` (u16): source port of the connecting client process
+    ///
     /// `process_id()` on the record gives the PID of the connecting process.
-    fn try_start_etw(listen_port: u16, port_to_pid: Arc<Mutex<HashMap<u16, u32>>>) -> bool {
+    fn try_start_etw(
+        listen_port: u16,
+        port_to_pid: Arc<Mutex<HashMap<u16, (u32, std::time::Instant)>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, (String, std::time::Instant)>>>,
+    ) -> bool {
         use std::time::Duration;
 
         use ferrisetw::EventRecord;
@@ -260,15 +298,24 @@ mod imp {
                                 return;
                             }
 
-                            // Store only the PID — cheap, no syscalls.
-                            // Exe name resolution is deferred to `lookup()`
-                            // so we never block the ETW consumer thread.
-                            let mut map = port_to_pid.lock().unwrap();
-                            if !map.contains_key(&sport) {
-                                map.insert(sport, pid);
-                                log::debug!("ETW: captured pid={}, sport={}", pid, sport);
+                            let mut pid_map = port_to_pid.lock();
+                            let mut exe_map = port_to_exe.lock();
+                            let now = std::time::Instant::now();
+                            pid_map.insert(sport, (pid, now));
+                            exe_map.remove(&sport);
+                            if pid_map.len() > 1000 {
+                                pid_map.retain(|_, (_, time)| {
+                                    now.duration_since(*time) < std::time::Duration::from_secs(30)
+                                });
                             }
-                            drop(map);
+                            if exe_map.len() > 1000 {
+                                exe_map.retain(|_, (_, time)| {
+                                    now.duration_since(*time) < std::time::Duration::from_secs(30)
+                                });
+                            }
+                            log::debug!("ETW: captured pid={}, sport={}", pid, sport);
+                            drop(pid_map);
+                            drop(exe_map);
                         },
                     )
                     .build();
@@ -332,13 +379,17 @@ mod imp {
                 return false;
             }
 
-            let mut tp = TOKEN_PRIVILEGES::default();
-            tp.PrivilegeCount = 1;
+            let mut tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                ..Default::default()
+            };
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
             let ret = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
-            let _ = CloseHandle(token);
+            if let Err(e) = CloseHandle(token) {
+                log::warn!("ETW: CloseHandle failed: {:?}", e);
+            }
 
             if ret.is_err() {
                 log::debug!("ETW: AdjustTokenPrivileges failed: {:?}", ret);
@@ -389,13 +440,15 @@ pub use imp::ExeResolver;
 
 #[cfg(not(windows))]
 mod imp {
+    use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[derive(Clone)]
     pub struct ExeResolver {
-        port_to_pid: Arc<Mutex<HashMap<u16, u32>>>,
-        port_to_exe: Arc<Mutex<HashMap<u16, String>>>,
+        port_to_pid: Arc<Mutex<HashMap<u16, (u32, Instant)>>>,
+        port_to_exe: Arc<Mutex<HashMap<u16, (String, Instant)>>>,
         listen_port: u16,
     }
 
@@ -409,19 +462,30 @@ mod imp {
         }
 
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
-            if let Some(exe) = self.port_to_exe.lock().unwrap().get(&remote_port).cloned() {
+            if let Some((exe, _)) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
-            let cached_pid = self.port_to_pid.lock().unwrap().get(&remote_port).copied();
+            let cached_pid = self
+                .port_to_pid
+                .lock()
+                .get(&remote_port)
+                .map(|(pid, _)| *pid);
             if let Some(pid) = cached_pid {
                 let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                     .await
                     .ok()??;
-                self.port_to_exe
-                    .lock()
-                    .unwrap()
-                    .insert(remote_port, exe.clone());
+                let pid_map = self.port_to_pid.lock();
+                if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
+                    let mut exe_map = self.port_to_exe.lock();
+                    exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                    if exe_map.len() > 1000 {
+                        let now = Instant::now();
+                        exe_map.retain(|_, (_, time)| {
+                            now.duration_since(*time) < Duration::from_secs(30)
+                        });
+                    }
+                }
                 return Some(exe);
             }
 
@@ -432,22 +496,38 @@ mod imp {
             .await
             .ok()??;
 
-            self.port_to_pid.lock().unwrap().insert(remote_port, result);
+            {
+                let mut pid_map = self.port_to_pid.lock();
+                pid_map.insert(remote_port, (result, Instant::now()));
+                if pid_map.len() > 1000 {
+                    let now = Instant::now();
+                    pid_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
+            }
 
             let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
                 .await
                 .ok()??;
-            self.port_to_exe
-                .lock()
-                .unwrap()
-                .insert(remote_port, exe.clone());
+            let pid_map = self.port_to_pid.lock();
+            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(result) {
+                let mut exe_map = self.port_to_exe.lock();
+                exe_map.insert(remote_port, (exe.clone(), Instant::now()));
+                if exe_map.len() > 1000 {
+                    let now = Instant::now();
+                    exe_map
+                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
+                }
+            }
             Some(exe)
         }
 
         pub fn remove(&self, port: u16) {
-            self.port_to_pid.lock().unwrap().remove(&port);
-            self.port_to_exe.lock().unwrap().remove(&port);
+            self.port_to_pid.lock().remove(&port);
+            self.port_to_exe.lock().remove(&port);
         }
+
+        pub fn cleanup(&self) {}
     }
 }
 

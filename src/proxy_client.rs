@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn get_socks5_error(code: u8) -> &'static str {
@@ -39,12 +39,12 @@ impl ProxyConfig {
     pub fn from_url(url: &str) -> Result<Self> {
         let url = url.trim().trim_matches('`').trim_matches('"');
 
-        let (proxy_type, rest) = if url.starts_with("socks5h://") {
-            (ProxyType::Socks5h, &url[10..])
-        } else if url.starts_with("socks5://") {
-            (ProxyType::Socks5, &url[9..])
-        } else if url.starts_with("http://") {
-            (ProxyType::Http, &url[7..])
+        let (proxy_type, rest) = if let Some(rest) = url.strip_prefix("socks5h://") {
+            (ProxyType::Socks5h, rest)
+        } else if let Some(rest) = url.strip_prefix("socks5://") {
+            (ProxyType::Socks5, rest)
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            (ProxyType::Http, rest)
         } else {
             return Err(anyhow::anyhow!("Unsupported proxy URL: {}", url));
         };
@@ -257,30 +257,46 @@ impl ProxyClient {
             port,
             self.config.addr
         );
+
+        let formatted_host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]", host)
+        } else {
+            host.to_string()
+        };
+
         let connect_request = format!(
-            "CONNECT {}:{} HTTP/1.1\r\n\
-             Host: {}:{}\r\n\
-             \r\n",
-            host, port, host, port
+            "CONNECT {formatted_host}:{port} HTTP/1.1\r\n\
+Host: {formatted_host}:{port}\r\n\
+\r\n"
         );
 
         stream.write_all(connect_request.as_bytes()).await?;
 
-        let mut response = Vec::new();
-        let mut byte = [0u8; 1];
-
-        loop {
-            stream.read_exact(&mut byte).await?;
-            response.push(byte[0]);
-
-            if response.ends_with(b"\r\n\r\n") {
-                break;
+        // Peek-based buffered HTTP response header reader to avoid byte-by-byte reads
+        let mut buf = vec![0u8; 1024];
+        let mut total_peeked = 0;
+        let header_len = loop {
+            let n = stream.peek(&mut buf[total_peeked..]).await?;
+            if n == 0 {
+                return Err(anyhow::anyhow!(
+                    "Connection closed while reading CONNECT response"
+                ));
             }
-
-            if response.len() > 8192 {
-                return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
+            total_peeked += n;
+            if let Some(pos) = find_header_separator(&buf[..total_peeked]) {
+                break pos;
             }
-        }
+            if total_peeked >= buf.len() {
+                if buf.len() >= 8192 {
+                    return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
+                }
+                buf.resize(buf.len() * 2, 0u8);
+            }
+        };
+
+        // Read exactly the header bytes from the socket
+        let mut response = vec![0u8; header_len];
+        stream.read_exact(&mut response).await?;
 
         let response_str = String::from_utf8_lossy(&response);
         let status_line = response_str.lines().next().unwrap_or("");
@@ -292,5 +308,47 @@ impl ProxyClient {
                 status_line.trim()
             ))
         }
+    }
+}
+
+fn find_header_separator(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 {
+        return None;
+    }
+    for i in 0..buf.len() - 1 {
+        if buf[i] == b'\n' {
+            if buf[i + 1] == b'\n' {
+                return Some(i + 2);
+            }
+            if i + 2 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+                return Some(i + 3);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_config_from_url() {
+        // Valid URLs
+        let c1 = ProxyConfig::from_url("socks5://127.0.0.1:1080").unwrap();
+        assert!(matches!(c1.proxy_type, ProxyType::Socks5));
+        assert_eq!(c1.addr, "127.0.0.1:1080");
+
+        let c2 = ProxyConfig::from_url("socks5h://192.168.1.1:8080").unwrap();
+        assert!(matches!(c2.proxy_type, ProxyType::Socks5h));
+        assert_eq!(c2.addr, "192.168.1.1:8080");
+
+        let c3 = ProxyConfig::from_url("http://localhost:8118").unwrap();
+        assert!(matches!(c3.proxy_type, ProxyType::Http));
+        assert_eq!(c3.addr, "localhost:8118");
+
+        // Invalid URLs
+        assert!(ProxyConfig::from_url("socks5://127.0.0.1").is_err()); // missing port
+        assert!(ProxyConfig::from_url("ftp://127.0.0.1:21").is_err()); // unsupported scheme
     }
 }

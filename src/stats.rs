@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64},
+};
 
 pub struct TrafficStats {
     pub listen_addr: String,
