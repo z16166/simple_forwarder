@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 pub struct ProxyServer {
     listener: TcpListener,
-    tx: mpsc::Sender<()>,
     rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
     semaphore: Arc<Semaphore>,
     stats: Arc<TrafficStats>,
@@ -33,7 +32,6 @@ pub struct ProxyServer {
 impl ProxyServer {
     pub async fn new(
         listen_addr: SocketAddr,
-        tx: mpsc::Sender<()>,
         rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
         stats: Arc<TrafficStats>,
         tracker: Arc<ConnectionTracker>,
@@ -45,7 +43,6 @@ impl ProxyServer {
         log::info!("Proxy server listening on {}", listen_addr);
         Ok(Self {
             listener,
-            tx,
             rules,
             semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             stats,
@@ -59,9 +56,8 @@ impl ProxyServer {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     log::debug!("Accepted connection from {}", peer_addr);
-                    let _ = self.tx.try_send(());
+                    self.stats.traffic_active.store(true, Ordering::Relaxed);
 
-                    let tx = self.tx.clone();
                     let rules = self.rules.clone();
                     let stats = self.stats.clone();
                     let tracker = self.tracker.clone();
@@ -85,7 +81,6 @@ impl ProxyServer {
                             stream,
                             peer_addr,
                             rules,
-                            tx,
                             stats,
                             tracker,
                             exe_resolver,
@@ -108,7 +103,6 @@ async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     rules: Arc<ArcSwap<Vec<(RuleMatcher, ProxyConfig)>>>,
-    tx: mpsc::Sender<()>,
     stats: Arc<TrafficStats>,
     tracker: Arc<ConnectionTracker>,
     exe_resolver: ExeResolver,
@@ -189,7 +183,6 @@ async fn handle_connection(
                 host,
                 port,
                 peer_addr,
-                tx,
                 stats,
                 is_direct,
                 conn_id,
@@ -632,14 +625,11 @@ async fn relay_data(
     host: String,
     port: u16,
     peer_addr: SocketAddr,
-    tx: mpsc::Sender<()>,
     stats: Arc<TrafficStats>,
     is_direct: bool,
     conn_id: u64,
     tracker: Arc<ConnectionTracker>,
 ) -> Result<()> {
-    let _ = tx.try_send(());
-
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
@@ -656,6 +646,7 @@ async fn relay_data(
                         stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_sent(conn_id, n as u64);
+                    stats.traffic_active.store(true, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
@@ -678,6 +669,7 @@ async fn relay_data(
                         stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     tracker.add_bytes_received(conn_id, n as u64);
+                    stats.traffic_active.store(true, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
