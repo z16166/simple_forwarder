@@ -10,15 +10,15 @@ const CLOSED_RETENTION: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct ConnectionInfo {
     pub id: u64,
-    pub source_ip: String,
-    pub outbound_target: String,
-    pub proxy_protocol: String,
-    pub proxy: String,
-    pub start_time: String,
-    pub status: String,
+    pub source_ip: Arc<str>,
+    pub outbound_target: Arc<str>,
+    pub proxy_protocol: Arc<str>,
+    pub proxy: Arc<str>,
+    pub start_time: Arc<str>,
+    pub status: Arc<str>,
     pub bytes_sent: Arc<AtomicU64>,
     pub bytes_received: Arc<AtomicU64>,
-    pub exe_name: String,
+    pub exe_name: Arc<str>,
     closed_at: Option<Instant>,
 }
 
@@ -54,15 +54,15 @@ impl ConnectionTracker {
         let bytes_received = Arc::new(AtomicU64::new(0));
         let info = ConnectionInfo {
             id,
-            source_ip,
-            outbound_target,
-            proxy_protocol,
-            proxy: String::from("connecting..."),
-            start_time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            status: String::from("connecting"),
+            source_ip: Arc::from(source_ip),
+            outbound_target: Arc::from(outbound_target),
+            proxy_protocol: Arc::from(proxy_protocol),
+            proxy: Arc::from("connecting..."),
+            start_time: Arc::from(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+            status: Arc::from("connecting"),
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
-            exe_name: String::new(),
+            exe_name: Arc::from(""),
             closed_at: None,
         };
         let mut state = self.state.lock();
@@ -86,42 +86,42 @@ impl ConnectionTracker {
     pub fn set_exe_name(&self, id: u64, exe_name: String) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.exe_name = exe_name;
+            conn.exe_name = Arc::from(exe_name);
         }
     }
 
     pub fn set_proxy(&self, id: u64, proxy: String) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.proxy = proxy;
+            conn.proxy = Arc::from(proxy);
         }
     }
 
     pub fn set_outbound_target(&self, id: u64, target: String) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.outbound_target = target;
+            conn.outbound_target = Arc::from(target);
         }
     }
 
     pub fn set_proxy_protocol(&self, id: u64, protocol: String) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.proxy_protocol = protocol;
+            conn.proxy_protocol = Arc::from(protocol);
         }
     }
 
     pub fn set_connected(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = String::from("connected");
+            conn.status = Arc::from("connected");
         }
     }
 
     pub fn set_closed(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = String::from("closed");
+            conn.status = Arc::from("closed");
             conn.closed_at = Some(Instant::now());
         }
     }
@@ -129,7 +129,7 @@ impl ConnectionTracker {
     pub fn set_error(&self, id: u64, err: &str) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = format!("error: {}", err);
+            conn.status = Arc::from(format!("error: {}", err));
             conn.closed_at = Some(Instant::now());
         }
     }
@@ -191,8 +191,8 @@ mod tests {
             let snap = tracker.snapshot();
             assert_eq!(snap.len(), 1);
             assert_eq!(snap[0].id, 1);
-            assert_eq!(snap[0].source_ip, "127.0.0.1:12345");
-            assert_eq!(snap[0].status, "connecting");
+            assert_eq!(&*snap[0].source_ip, "127.0.0.1:12345");
+            assert_eq!(&*snap[0].status, "connecting");
             assert_eq!(snap[0].bytes_sent.load(Ordering::Relaxed), 0);
             assert_eq!(snap[0].bytes_received.load(Ordering::Relaxed), 0);
         }
@@ -206,8 +206,8 @@ mod tests {
         {
             let snap = tracker.snapshot();
             assert_eq!(snap.len(), 1);
-            assert_eq!(snap[0].status, "connected");
-            assert_eq!(snap[0].exe_name, "chrome.exe");
+            assert_eq!(&*snap[0].status, "connected");
+            assert_eq!(&*snap[0].exe_name, "chrome.exe");
             assert_eq!(snap[0].bytes_sent.load(Ordering::Relaxed), 1024);
             assert_eq!(snap[0].bytes_received.load(Ordering::Relaxed), 2048);
         }
@@ -217,7 +217,7 @@ mod tests {
         {
             let snap = tracker.snapshot();
             assert_eq!(snap.len(), 1);
-            assert_eq!(snap[0].status, "closed");
+            assert_eq!(&*snap[0].status, "closed");
         }
     }
 }

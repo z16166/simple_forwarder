@@ -102,13 +102,13 @@ impl TableDataSource for TrafficDataSource {
             };
         };
         match column {
-            0 => TableValue::String(conn.source_ip.clone()),
-            1 => TableValue::String(conn.outbound_target.clone()),
-            2 => TableValue::String(conn.exe_name.clone()),
-            3 => TableValue::String(conn.proxy_protocol.clone()),
-            4 => TableValue::String(conn.proxy.clone()),
-            5 => TableValue::String(conn.start_time.clone()),
-            6 => TableValue::String(conn.status.clone()),
+            0 => TableValue::String(conn.source_ip.to_string()),
+            1 => TableValue::String(conn.outbound_target.to_string()),
+            2 => TableValue::String(conn.exe_name.to_string()),
+            3 => TableValue::String(conn.proxy_protocol.to_string()),
+            4 => TableValue::String(conn.proxy.to_string()),
+            5 => TableValue::String(conn.start_time.to_string()),
+            6 => TableValue::String(conn.status.to_string()),
             COL_BYTES_SENT => TableValue::String(TrafficStats::format_bytes(
                 conn.bytes_sent.load(Ordering::Relaxed),
             )),
