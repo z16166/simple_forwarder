@@ -11,10 +11,25 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONNECTIONS: usize = 1024;
 
-use crate::connection_tracker::ConnectionTracker;
+/// Initial capacity for HTTP header read buffer.
+const HTTP_HEADER_INITIAL_BUF_SIZE: usize = 4096;
+/// Maximum allowed length of HTTP headers (bytes).
+const HTTP_HEADER_MAX_LEN: usize = 16384;
+/// Buffer size for bidirectional relay copy.
+const RELAY_BUF_SIZE: usize = 8192;
+/// Maximum length of SOCKS4 handshake data (User ID + Domain).
+const SOCKS4_HANDSHAKE_MAX_LEN: usize = 1024;
+/// Linger timeout: how long to wait for the peer to finish after one side closes.
+const LINGER_TIMEOUT_SECS: u64 = 15;
+/// Default port for HTTPS (used when CONNECT URI has no port).
+const HTTPS_DEFAULT_PORT: u16 = 443;
+/// Default port for HTTP (used when regular HTTP URI has no port).
+const HTTP_DEFAULT_PORT: u16 = 80;
+
+use crate::connection_tracker::{ConnectionTracker, Protocol};
 use crate::etw_resolver::ExeResolver;
 use crate::matcher::RuleMatcher;
-use crate::proxy_client::{CONNECT_TIMEOUT, ProxyClient, ProxyConfig, ProxyType};
+use crate::proxy_client::{CONNECT_TIMEOUT, ProxyClient, ProxyConfig};
 use crate::stats::TrafficStats;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -39,6 +54,7 @@ impl ProxyServer {
         let listener = TcpListener::bind(listen_addr)
             .await
             .with_context(|| format!("Failed to bind to {}", listen_addr))?;
+        // TCP_NODELAY is set per-accepted connection in handle_connection below.
         log::info!("Proxy server listening on {}", listen_addr);
         Ok(Self {
             listener,
@@ -55,6 +71,9 @@ impl ProxyServer {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     log::debug!("Accepted connection from {}", peer_addr);
+                    // TCP_NODELAY: disable Nagle's algorithm for lower latency
+                    // on interactive proxy traffic (HTTP, SSH, etc.) (Issue 18).
+                    let _ = stream.set_nodelay(true);
                     self.stats.traffic_active.store(true, Ordering::Relaxed);
 
                     let rules = self.rules.clone();
@@ -106,7 +125,7 @@ pub struct HandshakeResult {
     pub port: u16,
     pub proxy_desc: String,
     pub is_direct: bool,
-    pub protocol: String,
+    pub protocol: Protocol,
     pub leftover: Bytes,
 }
 
@@ -180,7 +199,7 @@ async fn handle_connection(
 
     match res {
         Ok(Ok(hr)) => {
-            tracker.set_proxy_protocol(conn_id, hr.protocol);
+            tracker.set_proxy_protocol(conn_id, hr.protocol.to_string());
             tracker.set_outbound_target(conn_id, format!("{}:{}", hr.host, hr.port));
             tracker.set_proxy(conn_id, hr.proxy_desc.clone());
             tracker.set_connected(conn_id);
@@ -188,16 +207,18 @@ async fn handle_connection(
             let result = relay_data(
                 hr.client_stream,
                 hr.target_stream,
-                hr.host,
-                hr.port,
-                peer_addr,
-                stats,
-                hr.is_direct,
-                conn_id,
-                tracker,
-                hr.leftover,
-                bytes_sent_counter,
-                bytes_received_counter,
+                RelayContext {
+                    host: hr.host,
+                    port: hr.port,
+                    peer_addr,
+                    stats,
+                    is_direct: hr.is_direct,
+                    conn_id,
+                    tracker,
+                    leftover: hr.leftover,
+                    bytes_sent: bytes_sent_counter,
+                    bytes_received: bytes_received_counter,
+                },
             )
             .await;
             exe_resolver.remove(peer_addr.port());
@@ -235,6 +256,9 @@ async fn handle_socks4(
 
     let port = u16::from_be_bytes([header[1], header[2]]);
     let ip_bytes = [header[3], header[4], header[5], header[6]];
+    // SOCKS4a detection: IP 0.0.0.x (x != 0) signals that the real destination
+    // hostname follows the User ID as a null-terminated string. This is the
+    // SOCKS4a protocol extension (RFC 1929 analogue for SOCKS4).
     let is_socks4a = ip_bytes[0] == 0 && ip_bytes[1] == 0 && ip_bytes[2] == 0 && ip_bytes[3] != 0;
 
     // Read User ID and Domain Name in chunks to avoid byte-by-byte read syscalls
@@ -261,7 +285,7 @@ async fn handle_socks4(
             break;
         }
 
-        if buf.len() > 1024 {
+        if buf.len() > SOCKS4_HANDSHAKE_MAX_LEN {
             return Err(anyhow::anyhow!("SOCKS4 handshake data too long"));
         }
 
@@ -272,12 +296,24 @@ async fn handle_socks4(
         buf.put_slice(&temp[..n]);
     }
 
-    let u_end = user_id_end.unwrap();
+    let Some(u_end) = user_id_end else {
+        return Err(anyhow::anyhow!("SOCKS4: missing User ID terminator"));
+    };
+    // Issue 26: validate individual field lengths.
+    if u_end > 255 {
+        return Err(anyhow::anyhow!("SOCKS4: User ID too long ({} bytes)", u_end));
+    }
     let _user_id = buf.split_to(u_end + 1).freeze();
 
     let host = if is_socks4a {
-        let d_end = domain_end.unwrap();
+        let Some(d_end) = domain_end else {
+            return Err(anyhow::anyhow!("SOCKS4a: missing domain name terminator"));
+        };
         let domain_len = d_end - (u_end + 1);
+        // DNS name limit is 253 characters (RFC 1035).
+        if domain_len > 253 {
+            return Err(anyhow::anyhow!("SOCKS4a: domain name too long ({} bytes)", domain_len));
+        }
         let domain = buf.split_to(domain_len + 1).freeze();
         String::from_utf8_lossy(&domain[..domain_len]).to_string()
     } else {
@@ -292,7 +328,7 @@ async fn handle_socks4(
         Some(IpAddr::V4(Ipv4Addr::from(ip_bytes)))
     };
 
-    log::info!(
+    log::debug!(
         "SOCKS4{} request from {}: {}:{}",
         if is_socks4a { "a" } else { "" },
         peer_addr,
@@ -311,7 +347,7 @@ async fn handle_socks4(
 
     send_socks4_reply(&mut stream, 0x5A).await?;
 
-    let proto = if is_socks4a { "SOCKS4a" } else { "SOCKS4" };
+    let proto = if is_socks4a { Protocol::Socks4a } else { Protocol::Socks4 };
     Ok(HandshakeResult {
         client_stream: stream,
         target_stream,
@@ -319,7 +355,7 @@ async fn handle_socks4(
         port,
         proxy_desc,
         is_direct,
-        protocol: proto.to_string(),
+        protocol: proto,
         leftover,
     })
 }
@@ -417,18 +453,14 @@ async fn handle_socks5(
         }
     };
 
-    log::info!("SOCKS5 request from {}: {}:{}", peer_addr, host, port);
+    log::debug!("SOCKS5 request from {}: {}:{}", peer_addr, host, port);
 
     let (target_stream, proxy_desc, is_direct) =
         connect_to_target(&host, port, resolve_hostname, ip, rules, &mut stream, true).await?;
 
     send_success_reply(&mut stream).await?;
 
-    let proto = if resolve_hostname {
-        "SOCKS5h"
-    } else {
-        "SOCKS5"
-    };
+    let proto = if resolve_hostname { Protocol::Socks5h } else { Protocol::Socks5 };
     Ok(HandshakeResult {
         client_stream: stream,
         target_stream,
@@ -436,25 +468,25 @@ async fn handle_socks5(
         port,
         proxy_desc,
         is_direct,
-        protocol: proto.to_string(),
+        protocol: proto,
         leftover: Bytes::new(),
     })
 }
 
 async fn read_http_headers(stream: &mut TcpStream, first_byte: u8) -> Result<(Vec<u8>, Bytes)> {
-    let mut buf = BytesMut::with_capacity(4096);
+    let mut buf = BytesMut::with_capacity(HTTP_HEADER_INITIAL_BUF_SIZE);
     buf.put_u8(first_byte);
     let mut temp = [0u8; 1024];
     let mut start_pos = 0;
     loop {
-        if let Some(pos) = find_header_separator(&buf, start_pos) {
-            if pos > 16384 {
+        if let Some(pos) = crate::util::find_header_separator(&buf, start_pos) {
+            if pos > HTTP_HEADER_MAX_LEN {
                 return Err(anyhow::anyhow!("HTTP headers too long"));
             }
             let headers = buf.split_to(pos).freeze();
             return Ok((headers.to_vec(), buf.freeze()));
         }
-        if buf.len() > 16384 {
+        if buf.len() > HTTP_HEADER_MAX_LEN {
             return Err(anyhow::anyhow!("HTTP headers too long"));
         }
         start_pos = buf.len();
@@ -468,58 +500,59 @@ async fn read_http_headers(stream: &mut TcpStream, first_byte: u8) -> Result<(Ve
     }
 }
 
-fn find_header_separator(buf: &[u8], start_pos: usize) -> Option<usize> {
-    if buf.len() < 2 {
-        return None;
-    }
-    let start = start_pos.saturating_sub(3);
-    for i in start..buf.len() - 1 {
-        if buf[i] == b'\n' {
-            if buf[i + 1] == b'\n' {
-                return Some(i + 2);
-            }
-            if i + 2 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
-                return Some(i + 3);
-            }
-        }
-    }
-    None
-}
-
 fn filter_hop_by_hop_headers(headers: &[u8]) -> Vec<u8> {
-    let headers_str = String::from_utf8_lossy(headers);
-    let hop_by_hop = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
+    // Hop-by-hop headers to strip (lowercase). Kept as byte slices for
+    // direct ASCII case-insensitive comparison without String allocation (Issue 21).
+    const HOP_BY_HOP: [&[u8]; 9] = [
+        b"connection",
+        b"keep-alive",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailers",
+        b"transfer-encoding",
+        b"upgrade",
     ];
 
-    let mut filtered = String::new();
-    for line in headers_str.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    let mut filtered = Vec::with_capacity(headers.len());
+    let mut pos = 0;
+    while pos < headers.len() {
+        // Find end of line (\r\n or \n).
+        let line_end = headers[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| pos + i)
+            .unwrap_or(headers.len());
+        let line = &headers[pos..line_end];
+        // Advance past the newline character(s).
+        pos = line_end + 1;
+
+        // Strip trailing \r — line_end points at \n, so \r\n lines still
+        // carry the \r in the slice. Without this we'd emit \r\r\n.
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+        // Skip empty lines (end-of-headers marker is handled by caller).
+        if line.is_empty() {
             continue;
         }
-        let is_hop = hop_by_hop.iter().any(|&h| {
-            if trimmed.len() > h.len() && trimmed.as_bytes()[h.len()] == b':' {
-                trimmed[..h.len()].eq_ignore_ascii_case(h)
+
+        // Check if this line starts with a hop-by-hop header name followed by ':'.
+        let is_hop = HOP_BY_HOP.iter().any(|&name| {
+            if line.len() > name.len() && line[name.len()] == b':' {
+                line[..name.len()].eq_ignore_ascii_case(name)
             } else {
                 false
             }
         });
+
         if !is_hop {
-            filtered.push_str(line);
-            filtered.push_str("\r\n");
+            filtered.extend_from_slice(line);
+            filtered.extend_from_slice(b"\r\n");
         }
     }
-    filtered.push_str("\r\n");
-    filtered.into_bytes()
+    filtered.extend_from_slice(b"\r\n");
+    filtered
 }
 
 async fn handle_http(
@@ -559,16 +592,16 @@ async fn handle_http(
                 .ok_or_else(|| anyhow::anyhow!("Invalid IPv6 CONNECT URI: {}", uri))?;
             let host = uri[1..end_bracket].to_string();
             let port = if uri.len() > end_bracket + 2 && uri.as_bytes()[end_bracket + 1] == b':' {
-                uri[end_bracket + 2..].parse().unwrap_or(443)
+                uri[end_bracket + 2..].parse().unwrap_or(HTTPS_DEFAULT_PORT)
             } else {
-                443
+                HTTPS_DEFAULT_PORT
             };
             (host, port, true)
         } else {
             // IPv4 or domain: host:port
             let (host, port) = match uri.rsplit_once(':') {
-                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
-                None => (uri.to_string(), 443),
+                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(HTTPS_DEFAULT_PORT)),
+                None => (uri.to_string(), HTTPS_DEFAULT_PORT),
             };
             (host, port, true)
         }
@@ -580,11 +613,11 @@ async fn handle_http(
             .host()
             .ok_or_else(|| anyhow::anyhow!("Missing host in HTTP URI"))?
             .to_string();
-        let port = uri_parsed.port_u16().unwrap_or(80);
+        let port = uri_parsed.port_u16().unwrap_or(HTTP_DEFAULT_PORT);
         (host, port, false)
     };
 
-    log::info!(
+    log::debug!(
         "HTTP {} request from {}: {}:{}",
         method,
         peer_addr,
@@ -658,7 +691,7 @@ async fn handle_http(
         port,
         proxy_desc,
         is_direct,
-        protocol: "HTTP".to_string(),
+        protocol: Protocol::Http,
         leftover,
     })
 }
@@ -674,17 +707,12 @@ async fn connect_to_target(
 ) -> Result<(TcpStream, String, bool)> {
     for (matcher, proxy_config) in rules {
         if matcher.matches(host, ip) {
-            log::info!(
+            log::debug!(
                 "Matched rule, forwarding {} to proxy: {}",
                 host,
                 proxy_config.addr
             );
-            let scheme = match proxy_config.proxy_type {
-                ProxyType::Socks5 => "socks5",
-                ProxyType::Socks5h => "socks5h",
-                ProxyType::Http => "http",
-            };
-            let proxy_url = format!("{}://{}", scheme, proxy_config.addr);
+            let proxy_url = format!("{}://{}", proxy_config.proxy_type, proxy_config.addr);
             let client = ProxyClient::new(proxy_config.clone());
             match client.connect(host, port, resolve_hostname).await {
                 Ok(s) => return Ok((s, proxy_url, false)),
@@ -699,9 +727,12 @@ async fn connect_to_target(
         }
     }
 
-    log::info!("No rule matched, connecting directly to {}:{}", host, port);
+    log::debug!("No rule matched, connecting directly to {}:{}", host, port);
     match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-        Ok(Ok(s)) => Ok((s, "direct".to_string(), true)),
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            Ok((s, "direct".to_string(), true))
+        }
         Ok(Err(e)) => {
             log::error!("Failed to connect directly to {}:{}: {}", host, port, e);
             if is_socks {
@@ -724,10 +755,8 @@ async fn connect_to_target(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn relay_data(
-    stream: TcpStream,
-    target_stream: TcpStream,
+/// Context for bidirectional data relay, grouping related parameters (Issue 20).
+struct RelayContext {
     host: String,
     port: u16,
     peer_addr: SocketAddr,
@@ -738,38 +767,44 @@ async fn relay_data(
     leftover: Bytes,
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     bytes_received: Arc<std::sync::atomic::AtomicU64>,
+}
+
+async fn relay_data(
+    stream: TcpStream,
+    target_stream: TcpStream,
+    ctx: RelayContext,
 ) -> Result<()> {
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
     let client_to_target = async {
-        if !leftover.is_empty() {
-            target_writer.write_all(&leftover).await?;
-            if is_direct {
-                stats
+        if !ctx.leftover.is_empty() {
+            target_writer.write_all(&ctx.leftover).await?;
+            if ctx.is_direct {
+                ctx.stats
                     .direct_tx
-                    .fetch_add(leftover.len() as u64, Ordering::Relaxed);
+                    .fetch_add(ctx.leftover.len() as u64, Ordering::Relaxed);
             } else {
-                stats
+                ctx.stats
                     .upstream_tx
-                    .fetch_add(leftover.len() as u64, Ordering::Relaxed);
+                    .fetch_add(ctx.leftover.len() as u64, Ordering::Relaxed);
             }
-            bytes_sent.fetch_add(leftover.len() as u64, Ordering::Relaxed);
-            stats.traffic_active.store(true, Ordering::Relaxed);
+            ctx.bytes_sent.fetch_add(ctx.leftover.len() as u64, Ordering::Relaxed);
+            ctx.stats.traffic_active.store(true, Ordering::Relaxed);
         }
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; RELAY_BUF_SIZE];
         loop {
             match timeout(IDLE_TIMEOUT, client_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     target_writer.write_all(&buf[..n]).await?;
-                    if is_direct {
-                        stats.direct_tx.fetch_add(n as u64, Ordering::Relaxed);
+                    if ctx.is_direct {
+                        ctx.stats.direct_tx.fetch_add(n as u64, Ordering::Relaxed);
                     } else {
-                        stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
+                        ctx.stats.upstream_tx.fetch_add(n as u64, Ordering::Relaxed);
                     }
-                    bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                    stats.traffic_active.store(true, Ordering::Relaxed);
+                    ctx.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                    ctx.stats.traffic_active.store(true, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
@@ -780,19 +815,19 @@ async fn relay_data(
     };
 
     let target_to_client = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; RELAY_BUF_SIZE];
         loop {
             match timeout(IDLE_TIMEOUT, target_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     client_writer.write_all(&buf[..n]).await?;
-                    if is_direct {
-                        stats.direct_rx.fetch_add(n as u64, Ordering::Relaxed);
+                    if ctx.is_direct {
+                        ctx.stats.direct_rx.fetch_add(n as u64, Ordering::Relaxed);
                     } else {
-                        stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
+                        ctx.stats.upstream_rx.fetch_add(n as u64, Ordering::Relaxed);
                     }
-                    bytes_received.fetch_add(n as u64, Ordering::Relaxed);
-                    stats.traffic_active.store(true, Ordering::Relaxed);
+                    ctx.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+                    ctx.stats.traffic_active.store(true, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => return Err::<(), anyhow::Error>(e.into()),
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
@@ -816,13 +851,16 @@ async fn relay_data(
                 client_done = true;
                 match r {
                     Err(e) => {
-                        tracker.set_error(conn_id, &e.to_string());
+                        ctx.tracker.set_error(ctx.conn_id, &e.to_string());
                         log::error!("Client→Target relay error: {}", e);
                         return Err(e);
                     }
                     Ok(()) => {
                         if !target_done {
-                            linger_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                            // Linger: wait for the other side to finish draining
+                            // before fully closing. Prevents truncation of partial
+                            // responses when one half closes early.
+                            linger_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(LINGER_TIMEOUT_SECS))));
                         }
                     }
                 }
@@ -831,13 +869,14 @@ async fn relay_data(
                 target_done = true;
                 match r {
                     Err(e) => {
-                        tracker.set_error(conn_id, &e.to_string());
+                        ctx.tracker.set_error(ctx.conn_id, &e.to_string());
                         log::error!("Target→Client relay error: {}", e);
                         return Err(e);
                     }
                     Ok(()) => {
                         if !client_done {
-                            linger_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                            // Linger: wait for the other side to finish draining.
+                            linger_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(LINGER_TIMEOUT_SECS))));
                         }
                     }
                 }
@@ -849,19 +888,19 @@ async fn relay_data(
                     std::future::pending::<()>().await;
                 }
             }, if linger_timeout.is_some() => {
-                log::debug!("Linger timeout reached for connection {}, shutting down", conn_id);
-                tracker.set_closed(conn_id);
+                log::debug!("Linger timeout reached for connection {}, shutting down", ctx.conn_id);
+                ctx.tracker.set_closed(ctx.conn_id);
                 break;
             }
         }
 
         if client_done && target_done {
-            tracker.set_closed(conn_id);
+            ctx.tracker.set_closed(ctx.conn_id);
             break;
         }
     }
 
-    log::info!("Connection from {} to {}:{} closed", peer_addr, host, port);
+    log::debug!("Connection from {} to {}:{} closed", ctx.peer_addr, ctx.host, ctx.port);
     Ok(())
 }
 
@@ -910,25 +949,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_find_header_separator() {
-        let b1 = b"Host: localhost\r\n\r\n";
-        assert_eq!(find_header_separator(b1, 0), Some(b1.len()));
+    fn test_filter_hop_by_hop_headers() {
+        // Normal \r\n headers — should preserve \r\n exactly (no double \r).
+        let input = b"Host: example.com\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+        let out = filter_hop_by_hop_headers(input);
+        assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
 
-        let b2 = b"Host: localhost\n\n";
-        assert_eq!(find_header_separator(b2, 0), Some(b2.len()));
-
-        let b3 = b"Host: localhost\r\n\n";
-        assert_eq!(find_header_separator(b3, 0), Some(b3.len()));
-
-        let b4 = b"Host: localhost\n\r\n";
-        assert_eq!(find_header_separator(b4, 0), Some(b4.len()));
-
-        let b5 = b"Host: localhost\r\n";
-        assert_eq!(find_header_separator(b5, 0), None);
-
-        // Test start_pos optimization
-        let b6 = b"Host: localhost\r\n\r\nLeftover data";
-        assert_eq!(find_header_separator(b6, 15), Some(19));
+        // \n-only headers — should output \r\n (normalised).
+        let input = b"Host: example.com\nConnection: keep-alive\nContent-Length: 0\n\n";
+        let out = filter_hop_by_hop_headers(input);
+        assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
     }
 
     #[tokio::test]

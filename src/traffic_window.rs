@@ -43,7 +43,7 @@ const COL_COLOR_SENT: i32 = 9;
 const COL_COLOR_RECV: i32 = 10;
 
 struct TrafficDataSource {
-    connections: Vec<crate::connection_tracker::ConnectionInfo>,
+    connections: Vec<Arc<crate::connection_tracker::ConnectionInfo>>,
     /// IDs of the top-N connections by bytes sent (precomputed each tick).
     top_sent: HashSet<u64>,
     /// IDs of the top-N connections by bytes received (precomputed each tick).
