@@ -368,9 +368,12 @@ mod imp {
                         log::debug!("ETW: trace session started successfully");
                         // Keep _t alive so the trace runs for the program lifetime.
                         // The thread will be terminated on process exit (process::exit(0)).
-                        // Use a long sleep instead of `loop { park() }` to avoid
-                        // busy-looping on spurious wakeups (Issue 19).
-                        std::thread::sleep(std::time::Duration::from_secs(u64::MAX));
+                        // Sleep in a loop — a single sleep(u64::MAX) would saturate
+                        // to u32::MAX ms (~49.7 days) on Windows and return early,
+                        // dropping _t and silently stopping the ETW session.
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(3600));
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(false);
