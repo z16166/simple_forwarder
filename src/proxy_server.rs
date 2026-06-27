@@ -528,8 +528,12 @@ fn filter_hop_by_hop_headers(headers: &[u8]) -> Vec<u8> {
         // Advance past the newline character(s).
         pos = line_end + 1;
 
+        // Strip trailing \r — line_end points at \n, so \r\n lines still
+        // carry the \r in the slice. Without this we'd emit \r\r\n.
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
         // Skip empty lines (end-of-headers marker is handled by caller).
-        if line.is_empty() || line == b"\r" {
+        if line.is_empty() {
             continue;
         }
 
@@ -943,6 +947,19 @@ async fn send_success_reply(stream: &mut TcpStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_filter_hop_by_hop_headers() {
+        // Normal \r\n headers — should preserve \r\n exactly (no double \r).
+        let input = b"Host: example.com\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+        let out = filter_hop_by_hop_headers(input);
+        assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
+
+        // \n-only headers — should output \r\n (normalised).
+        let input = b"Host: example.com\nConnection: keep-alive\nContent-Length: 0\n\n";
+        let out = filter_hop_by_hop_headers(input);
+        assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
+    }
 
     #[tokio::test]
     async fn test_socks5_bounds_checking() {
