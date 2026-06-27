@@ -9,6 +9,9 @@ use tokio::time::{Duration, timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Timeout for write operations. Prevents indefinite blocking when a peer
+/// stops reading while the other side is still sending (TCP send buffer full).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 1024;
 
 /// Initial capacity for HTTP header read buffer.
@@ -779,7 +782,9 @@ async fn relay_data(
 
     let client_to_target = async {
         if !ctx.leftover.is_empty() {
-            target_writer.write_all(&ctx.leftover).await?;
+            timeout(WRITE_TIMEOUT, target_writer.write_all(&ctx.leftover))
+                .await
+                .map_err(|_| anyhow::anyhow!("Target leftover write timeout ({}s)", WRITE_TIMEOUT.as_secs()))??;
             if ctx.is_direct {
                 ctx.stats
                     .direct_tx
@@ -797,7 +802,9 @@ async fn relay_data(
             match timeout(IDLE_TIMEOUT, client_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    target_writer.write_all(&buf[..n]).await?;
+                    timeout(WRITE_TIMEOUT, target_writer.write_all(&buf[..n]))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Target write timeout ({}s)", WRITE_TIMEOUT.as_secs()))??;
                     if ctx.is_direct {
                         ctx.stats.direct_tx.fetch_add(n as u64, Ordering::Relaxed);
                     } else {
@@ -810,7 +817,7 @@ async fn relay_data(
                 Err(_) => return Err(anyhow::anyhow!("Client connection idle timeout")),
             }
         }
-        let _ = target_writer.shutdown().await;
+        let _ = timeout(WRITE_TIMEOUT, target_writer.shutdown()).await;
         Ok(())
     };
 
@@ -820,7 +827,9 @@ async fn relay_data(
             match timeout(IDLE_TIMEOUT, target_reader.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    client_writer.write_all(&buf[..n]).await?;
+                    timeout(WRITE_TIMEOUT, client_writer.write_all(&buf[..n]))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Client write timeout ({}s)", WRITE_TIMEOUT.as_secs()))??;
                     if ctx.is_direct {
                         ctx.stats.direct_rx.fetch_add(n as u64, Ordering::Relaxed);
                     } else {
@@ -833,7 +842,7 @@ async fn relay_data(
                 Err(_) => return Err(anyhow::anyhow!("Target connection idle timeout")),
             }
         }
-        let _ = client_writer.shutdown().await;
+        let _ = timeout(WRITE_TIMEOUT, client_writer.shutdown()).await;
         Ok(())
     };
 

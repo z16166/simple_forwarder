@@ -21,26 +21,70 @@ use proxy_client::ProxyConfig;
 use proxy_server::ProxyServer;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    if let Err(e) = run_app().await {
-        #[cfg(windows)]
-        unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-            use windows::core::HSTRING;
-            let _ = MessageBoxW(
-                None,
-                &HSTRING::from(format!("{} failed to start:\n\n{}", tray::APP_NAME, e)),
-                &HSTRING::from(&format!("{} - Startup Error", tray::APP_NAME)),
-                MB_OK | MB_ICONERROR,
-            );
+fn main() {
+    // Build the tokio runtime manually instead of using #[tokio::main] so
+    // the main thread is NOT a tokio worker. This lets us run the Win32
+    // message loop (GetMessageW) on the main thread without consuming a
+    // worker thread from the pool.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+                use windows::core::HSTRING;
+                let _ = MessageBoxW(
+                    None,
+                    &HSTRING::from(format!("Failed to initialize:\n\n{}", e)),
+                    &HSTRING::from(&format!("{} - Startup Error", tray::APP_NAME)),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+            #[cfg(not(windows))]
+            eprintln!("Fatal error: {}", e);
+            std::process::exit(1);
         }
-        return Err(e);
+    };
+
+    match rt.block_on(run_app_init()) {
+        Ok((_guard, tray_manager, exe_resolver)) => {
+            // Run the Win32 message loop on the main thread.
+            // Returns only when the user clicks Quit.
+            tray_manager.run_message_loop();
+            exe_resolver.cleanup();
+            log::info!("Shutting down.");
+            log::logger().flush();
+            std::process::exit(0);
+        }
+        Err(e) => {
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+                use windows::core::HSTRING;
+                let _ = MessageBoxW(
+                    None,
+                    &HSTRING::from(format!("{} failed to start:\n\n{}", tray::APP_NAME, e)),
+                    &HSTRING::from(&format!("{} - Startup Error", tray::APP_NAME)),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+            #[cfg(not(windows))]
+            eprintln!("Fatal error: {}", e);
+            std::process::exit(1);
+        }
     }
-    Ok(())
 }
 
-async fn run_app() -> Result<()> {
+/// Container for objects that must stay alive for the app's lifetime
+/// (single-instance lock, etc.).
+struct AppGuard {
+    _instance: single_instance::SingleInstance,
+}
+
+async fn run_app_init() -> Result<(AppGuard, tray::TrayManager, etw_resolver::ExeResolver)> {
     // Single instance check
     let _instance = {
         use single_instance::SingleInstance;
@@ -60,7 +104,7 @@ async fn run_app() -> Result<()> {
                     MB_OK | MB_ICONWARNING,
                 );
             }
-            return Ok(());
+            std::process::exit(0);
         }
         instance
     };
@@ -162,16 +206,9 @@ async fn run_app() -> Result<()> {
         }
     });
 
-    tray_manager.run_message_loop();
-
-    // run_message_loop() only returns when the user clicks Quit.
-    // The tokio runtime's thread pool (proxy server, config watcher, activity task)
-    // would otherwise keep the process—and its console window—alive indefinitely.
-    // Force a clean exit so everything (including the console) is released immediately.
-    log::info!("Shutting down.");
-    log::logger().flush();
-    exe_resolver.cleanup();
-    std::process::exit(0);
+    // Return ownership to main() — the message loop runs on the main thread
+    // outside the runtime, so no tokio worker is consumed.
+    Ok((AppGuard { _instance }, tray_manager, exe_resolver))
 }
 
 fn parse_rules(config: &Config) -> Result<Vec<(RuleMatcher, ProxyConfig)>> {
