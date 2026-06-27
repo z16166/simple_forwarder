@@ -1,5 +1,5 @@
-use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,12 +73,12 @@ pub struct ConnectionInfo {
 }
 
 struct TrackerState {
-    connections: HashMap<u64, ConnectionInfo>,
+    connections: HashMap<u64, Arc<ConnectionInfo>>,
     order: VecDeque<u64>,
 }
 
 pub struct ConnectionTracker {
-    state: Mutex<TrackerState>,
+    state: RwLock<TrackerState>,
     next_id: AtomicU64,
     /// Counter for periodic cleanup in snapshot() (Issue 16).
     snapshot_count: AtomicU64,
@@ -87,13 +87,28 @@ pub struct ConnectionTracker {
 impl ConnectionTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(TrackerState {
+            state: RwLock::new(TrackerState {
                 connections: HashMap::new(),
                 order: VecDeque::new(),
             }),
             next_id: AtomicU64::new(1),
             snapshot_count: AtomicU64::new(0),
         })
+    }
+
+    /// Copy-on-write update of a single connection. Clones the inner value,
+    /// applies `f`, then swaps in a fresh `Arc`. Readers holding the old
+    /// `Arc` keep seeing a consistent snapshot. The atomic counters
+    /// (`bytes_sent`/`bytes_received`) are shared via their own `Arc`s and
+    /// therefore keep updating live regardless of which `Arc<ConnectionInfo>`
+    /// a reader holds.
+    fn modify<F: FnOnce(&mut ConnectionInfo)>(&self, id: u64, f: F) {
+        let mut state = self.state.write();
+        if let Some(arc_conn) = state.connections.get_mut(&id) {
+            let mut new_conn = (**arc_conn).clone();
+            f(&mut new_conn);
+            *arc_conn = Arc::new(new_conn);
+        }
     }
 
     pub fn register(
@@ -118,8 +133,8 @@ impl ConnectionTracker {
             exe_name: Arc::from(""),
             closed_at: None,
         };
-        let mut state = self.state.lock();
-        state.connections.insert(id, info);
+        let mut state = self.state.write();
+        state.connections.insert(id, Arc::new(info));
         state.order.push_back(id);
         while state.order.len() > MAX_CONNECTIONS {
             if let Some(oldest_id) = state.order.pop_front()
@@ -137,78 +152,68 @@ impl ConnectionTracker {
     }
 
     pub fn set_exe_name(&self, id: u64, exe_name: String) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.exe_name = Arc::from(exe_name);
-        }
+        self.modify(id, |c| c.exe_name = Arc::from(exe_name));
     }
 
     pub fn set_proxy(&self, id: u64, proxy: String) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.proxy = Arc::from(proxy);
-        }
+        self.modify(id, |c| c.proxy = Arc::from(proxy));
     }
 
     pub fn set_outbound_target(&self, id: u64, target: String) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.outbound_target = Arc::from(target);
-        }
+        self.modify(id, |c| c.outbound_target = Arc::from(target));
     }
 
     pub fn set_proxy_protocol(&self, id: u64, protocol: String) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.proxy_protocol = Arc::from(protocol);
-        }
+        self.modify(id, |c| c.proxy_protocol = Arc::from(protocol));
     }
 
     pub fn set_connected(&self, id: u64) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = ConnStatus::Connected;
-        }
+        self.modify(id, |c| c.status = ConnStatus::Connected);
     }
 
     pub fn set_closed(&self, id: u64) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = ConnStatus::Closed;
-            conn.closed_at = Some(Instant::now());
-        }
+        self.modify(id, |c| {
+            c.status = ConnStatus::Closed;
+            c.closed_at = Some(Instant::now());
+        });
     }
 
     pub fn set_error(&self, id: u64, err: &str) {
-        let mut state = self.state.lock();
-        if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = ConnStatus::Error(err.to_string());
-            conn.closed_at = Some(Instant::now());
-        }
+        self.modify(id, |c| {
+            c.status = ConnStatus::Error(err.to_string());
+            c.closed_at = Some(Instant::now());
+        });
     }
 
-    pub fn snapshot(&self) -> Vec<ConnectionInfo> {
-        let mut guard = self.state.lock();
-        let state = &mut *guard;
-
-        // Run cleanup every 5 snapshots to reduce overhead (Issue 16).
+    pub fn snapshot(&self) -> Vec<Arc<ConnectionInfo>> {
         // snapshot() is called once per second by the traffic window.
+        // Run cleanup every 5 snapshots to reduce overhead (Issue 16).
+        // The cleanup tick needs a write lock; the other 4/5 take a cheap
+        // read lock so concurrent readers (and writers via `modify`/`register`)
+        // are not blocked (Issue 17).
         let count = self.snapshot_count.fetch_add(1, Ordering::Relaxed);
         if count % 5 == 0 {
+            let mut state = self.state.write();
             state
                 .connections
                 .retain(|_, c| c.closed_at.is_none_or(|t| t.elapsed() < CLOSED_RETENTION));
-            let active_connections = &state.connections;
-            state.order.retain(|id| active_connections.contains_key(id));
+            // Collect surviving ids first to avoid borrowing `state` inside
+            // the `retain` closure on `state.order`.
+            let live: HashSet<u64> = state.connections.keys().copied().collect();
+            state.order.retain(|id| live.contains(id));
+            state
+                .order
+                .iter()
+                .filter_map(|id| state.connections.get(id).cloned())
+                .collect()
+        } else {
+            let state = self.state.read();
+            state
+                .order
+                .iter()
+                .filter_map(|id| state.connections.get(id).cloned())
+                .collect()
         }
-
-        let mut list = Vec::with_capacity(state.connections.len());
-        for id in &state.order {
-            if let Some(conn) = state.connections.get(id) {
-                list.push(conn.clone());
-            }
-        }
-        list
     }
 }
 
