@@ -1,11 +1,61 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_CONNECTIONS: usize = 5000;
 const CLOSED_RETENTION: Duration = Duration::from_secs(5);
+
+// ── Connection status enum (Issue 14) ──────────────────────────────────
+
+/// Discrete connection status, replacing raw string literals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnStatus {
+    Connecting,
+    Connected,
+    Closed,
+    Error(String),
+}
+
+impl fmt::Display for ConnStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnStatus::Connecting => f.write_str("connecting"),
+            ConnStatus::Connected => f.write_str("connected"),
+            ConnStatus::Closed => f.write_str("closed"),
+            ConnStatus::Error(msg) => write!(f, "error: {}", msg),
+        }
+    }
+}
+
+// ── Protocol enum (Issue 14) ───────────────────────────────────────────
+
+/// Proxy protocol type, replacing raw string literals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Direct variant reserved for future use
+pub enum Protocol {
+    Socks4,
+    Socks4a,
+    Socks5,
+    Socks5h,
+    Http,
+    Direct,
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Socks4 => f.write_str("SOCKS4"),
+            Protocol::Socks4a => f.write_str("SOCKS4a"),
+            Protocol::Socks5 => f.write_str("SOCKS5"),
+            Protocol::Socks5h => f.write_str("SOCKS5h"),
+            Protocol::Http => f.write_str("HTTP"),
+            Protocol::Direct => f.write_str("Direct"),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ConnectionInfo {
@@ -15,7 +65,7 @@ pub struct ConnectionInfo {
     pub proxy_protocol: Arc<str>,
     pub proxy: Arc<str>,
     pub start_time: Arc<str>,
-    pub status: Arc<str>,
+    pub status: ConnStatus,
     pub bytes_sent: Arc<AtomicU64>,
     pub bytes_received: Arc<AtomicU64>,
     pub exe_name: Arc<str>,
@@ -30,6 +80,8 @@ struct TrackerState {
 pub struct ConnectionTracker {
     state: Mutex<TrackerState>,
     next_id: AtomicU64,
+    /// Counter for periodic cleanup in snapshot() (Issue 16).
+    snapshot_count: AtomicU64,
 }
 
 impl ConnectionTracker {
@@ -40,6 +92,7 @@ impl ConnectionTracker {
                 order: VecDeque::new(),
             }),
             next_id: AtomicU64::new(1),
+            snapshot_count: AtomicU64::new(0),
         })
     }
 
@@ -59,7 +112,7 @@ impl ConnectionTracker {
             proxy_protocol: Arc::from(proxy_protocol),
             proxy: Arc::from("connecting..."),
             start_time: Arc::from(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
-            status: Arc::from("connecting"),
+            status: ConnStatus::Connecting,
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
             exe_name: Arc::from(""),
@@ -114,14 +167,14 @@ impl ConnectionTracker {
     pub fn set_connected(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = Arc::from("connected");
+            conn.status = ConnStatus::Connected;
         }
     }
 
     pub fn set_closed(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = Arc::from("closed");
+            conn.status = ConnStatus::Closed;
             conn.closed_at = Some(Instant::now());
         }
     }
@@ -129,7 +182,7 @@ impl ConnectionTracker {
     pub fn set_error(&self, id: u64, err: &str) {
         let mut state = self.state.lock();
         if let Some(conn) = state.connections.get_mut(&id) {
-            conn.status = Arc::from(format!("error: {}", err));
+            conn.status = ConnStatus::Error(err.to_string());
             conn.closed_at = Some(Instant::now());
         }
     }
@@ -137,11 +190,17 @@ impl ConnectionTracker {
     pub fn snapshot(&self) -> Vec<ConnectionInfo> {
         let mut guard = self.state.lock();
         let state = &mut *guard;
-        state
-            .connections
-            .retain(|_, c| c.closed_at.is_none_or(|t| t.elapsed() < CLOSED_RETENTION));
-        let active_connections = &state.connections;
-        state.order.retain(|id| active_connections.contains_key(id));
+
+        // Run cleanup every 5 snapshots to reduce overhead (Issue 16).
+        // snapshot() is called once per second by the traffic window.
+        let count = self.snapshot_count.fetch_add(1, Ordering::Relaxed);
+        if count % 5 == 0 {
+            state
+                .connections
+                .retain(|_, c| c.closed_at.is_none_or(|t| t.elapsed() < CLOSED_RETENTION));
+            let active_connections = &state.connections;
+            state.order.retain(|id| active_connections.contains_key(id));
+        }
 
         let mut list = Vec::with_capacity(state.connections.len());
         for id in &state.order {
@@ -170,6 +229,9 @@ impl PartialEq for ConnectionInfo {
     }
 }
 
+// Eq is safe to implement since all fields support equality.
+impl Eq for ConnectionInfo {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,7 +254,7 @@ mod tests {
             assert_eq!(snap.len(), 1);
             assert_eq!(snap[0].id, 1);
             assert_eq!(&*snap[0].source_ip, "127.0.0.1:12345");
-            assert_eq!(&*snap[0].status, "connecting");
+            assert_eq!(snap[0].status, ConnStatus::Connecting);
             assert_eq!(snap[0].bytes_sent.load(Ordering::Relaxed), 0);
             assert_eq!(snap[0].bytes_received.load(Ordering::Relaxed), 0);
         }
@@ -206,7 +268,7 @@ mod tests {
         {
             let snap = tracker.snapshot();
             assert_eq!(snap.len(), 1);
-            assert_eq!(&*snap[0].status, "connected");
+            assert_eq!(snap[0].status, ConnStatus::Connected);
             assert_eq!(&*snap[0].exe_name, "chrome.exe");
             assert_eq!(snap[0].bytes_sent.load(Ordering::Relaxed), 1024);
             assert_eq!(snap[0].bytes_received.load(Ordering::Relaxed), 2048);
@@ -217,7 +279,7 @@ mod tests {
         {
             let snap = tracker.snapshot();
             assert_eq!(snap.len(), 1);
-            assert_eq!(&*snap[0].status, "closed");
+            assert_eq!(snap[0].status, ConnStatus::Closed);
         }
     }
 }

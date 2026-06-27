@@ -1,8 +1,40 @@
+// ── Cache configuration constants ─────────────────────────────────────
+
+/// Maximum number of entries in the PID/exe caches before eviction.
+const EXE_CACHE_CAPACITY: usize = 1000;
+/// Time-to-live for cache entries; stale entries are evicted on capacity overflow.
+const EXE_CACHE_TTL_SECS: u64 = 30;
+
+/// ETW session name, shared between startup and cleanup.
+const ETW_SESSION_NAME: &str = "SimpleFwd-NetTrace";
+
+// ── RAII handle wrapper (Issue 8) ──────────────────────────────────────
+
+/// RAII guard for Windows `HANDLE` values obtained from `OpenProcess`,
+/// `OpenProcessToken`, etc. Calls `CloseHandle` on drop.
+#[cfg(windows)]
+struct SafeHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl SafeHandle {
+    fn is_invalid(&self) -> bool {
+        self.0.is_invalid()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SafeHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); }
+        }
+    }
+}
+
 // ── Cross-platform PID → exe name ─────────────────────────────────────
 
 #[cfg(windows)]
 fn resolve_pid_to_exe(pid: u32) -> Option<String> {
-    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::{
         K32GetModuleFileNameExW, K32GetProcessImageFileNameW,
     };
@@ -10,25 +42,28 @@ fn resolve_pid_to_exe(pid: u32) -> Option<String> {
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
 
-    let handle =
-        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+    let handle = SafeHandle(raw);
+    if handle.is_invalid() {
+        return None;
+    }
 
+    // MAX_PATH on Windows is 260 wide characters.
+    const WINDOWS_MAX_PATH: usize = 260;
     let name = unsafe {
-        let mut buf = vec![0u16; 260];
-        let len = K32GetModuleFileNameExW(handle, None, &mut buf);
+        let mut buf = vec![0u16; WINDOWS_MAX_PATH];
+        let len = K32GetModuleFileNameExW(handle.0, None, &mut buf);
         let len = if len == 0 {
-            K32GetProcessImageFileNameW(handle, &mut buf)
+            K32GetProcessImageFileNameW(handle.0, &mut buf)
         } else {
             len
         };
         if len == 0 {
-            let _ = CloseHandle(handle);
             return None;
         }
         String::from_utf16_lossy(&buf[..len as usize])
     };
-
-    let _ = unsafe { CloseHandle(handle) };
+    // handle is dropped here → CloseHandle called automatically.
 
     std::path::Path::new(&name)
         .file_name()
@@ -46,7 +81,8 @@ fn resolve_pid_to_exe(pid: u32) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn resolve_pid_to_exe(pid: u32) -> Option<String> {
     // PROC_PIDPATHINFO_MAXSIZE = 4096
-    let mut buf = vec![0u8; 4096];
+    const MACOS_PROC_PIDPATH_MAXSIZE: usize = 4096;
+    let mut buf = vec![0u8; MACOS_PROC_PIDPATH_MAXSIZE];
     unsafe {
         let ret = libc::proc_pidpath(pid as i32, buf.as_mut_ptr() as *mut _, buf.len() as u32);
         if ret <= 0 {
@@ -102,6 +138,21 @@ mod netstat_fallback {
     }
 }
 
+// ── Cache eviction helper (Issue 2) ─────────────────────────────────────
+
+/// Evict stale entries from a port-keyed cache when it exceeds capacity.
+///
+/// Removes entries older than [`EXE_CACHE_TTL_SECS`] only when the map
+/// length exceeds [`EXE_CACHE_CAPACITY`], keeping eviction overhead bounded.
+fn evict_stale_entries<V>(map: &mut std::collections::HashMap<u16, (V, std::time::Instant)>) {
+    if map.len() > EXE_CACHE_CAPACITY {
+        let now = std::time::Instant::now();
+        map.retain(|_, (_, time)| {
+            now.duration_since(*time) < std::time::Duration::from_secs(EXE_CACHE_TTL_SECS)
+        });
+    }
+}
+
 // ── Windows implementation (ETW + netstat2 fallback) ────────────────────
 
 #[cfg(windows)]
@@ -110,7 +161,8 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
+    use super::{evict_stale_entries, ETW_SESSION_NAME};
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -144,6 +196,13 @@ mod imp {
         /// Uses `spawn_blocking` for any blocking OS call (netstat2 scan,
         /// `OpenProcess`+`K32GetModuleFileNameExW`) to avoid starving the
         /// Tokio worker thread pool.
+        ///
+        /// Note: this method is intentionally kept separate from the non-Windows
+        /// version rather than fully unified behind a trait. The Windows variant
+        /// has an extra ETW PID cache branch that makes the control flow differ
+        /// meaningfully; forcing both into a single generic would require a
+        /// strategy trait with marginal benefit. The shared cache logic is
+        /// extracted into `resolve_and_cache_pid` (Issue 4).
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
             // Fast path: already-resolved cache.
             if let Some((exe, _)) = self.port_to_exe.lock().get(&remote_port).cloned() {
@@ -158,26 +217,12 @@ mod imp {
                 .get(&remote_port)
                 .map(|(pid, _)| *pid);
             if let Some(pid) = etw_pid {
-                let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
-                    .await
-                    .ok()??;
-                let pid_map = self.port_to_pid.lock();
-                if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
-                    let mut exe_map = self.port_to_exe.lock();
-                    exe_map.insert(remote_port, (exe.clone(), Instant::now()));
-                    if exe_map.len() > 1000 {
-                        let now = Instant::now();
-                        exe_map.retain(|_, (_, time)| {
-                            now.duration_since(*time) < Duration::from_secs(30)
-                        });
-                    }
-                }
-                return Some(exe);
+                return self.resolve_and_cache_pid(remote_port, pid).await;
             }
 
             // Fallback: scan TCP connection table (blocking OS call).
             let listen_port = self.listen_port;
-            let result = tokio::task::spawn_blocking(move || {
+            let pid = tokio::task::spawn_blocking(move || {
                 super::netstat_fallback::lookup_port_to_pid(listen_port, remote_port)
             })
             .await
@@ -186,26 +231,26 @@ mod imp {
             // Cache the PID so future lookups on this port avoid another scan.
             {
                 let mut pid_map = self.port_to_pid.lock();
-                pid_map.insert(remote_port, (result, Instant::now()));
-                if pid_map.len() > 1000 {
-                    let now = Instant::now();
-                    pid_map
-                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
-                }
+                pid_map.insert(remote_port, (pid, Instant::now()));
+                evict_stale_entries(&mut pid_map);
             }
 
-            let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
+            self.resolve_and_cache_pid(remote_port, pid).await
+        }
+
+        /// Resolve PID → exe name and cache the result if the PID is still current.
+        ///
+        /// Lock ordering: always `port_to_pid` → `port_to_exe` (Issue 6).
+        async fn resolve_and_cache_pid(&self, remote_port: u16, pid: u32) -> Option<String> {
+            let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                 .await
                 .ok()??;
+            // Only cache if the PID hasn't changed since we started resolving.
             let pid_map = self.port_to_pid.lock();
-            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(result) {
+            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
                 let mut exe_map = self.port_to_exe.lock();
                 exe_map.insert(remote_port, (exe.clone(), Instant::now()));
-                if exe_map.len() > 1000 {
-                    let now = Instant::now();
-                    exe_map
-                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
-                }
+                evict_stale_entries(&mut exe_map);
             }
             Some(exe)
         }
@@ -217,7 +262,7 @@ mod imp {
         }
 
         pub fn cleanup(&self) {
-            etw_cleanup::stop_session_if_exists("SimpleFwd-NetTrace");
+            etw_cleanup::stop_session_if_exists(ETW_SESSION_NAME);
         }
     }
 
@@ -246,10 +291,10 @@ mod imp {
         use ferrisetw::trace::UserTrace;
 
         // Fixed session name so stale sessions from previous runs can be cleaned.
-        let session_name = "SimpleFwd-NetTrace";
+        let session_name = ETW_SESSION_NAME;
 
         // Best-effort cleanup: stop any previous session with this name.
-        etw_cleanup::stop_session_if_exists(session_name);
+        etw_cleanup::stop_session_if_exists(ETW_SESSION_NAME);
 
         // Kernel network providers require SeSystemProfilePrivilege, even as admin.
         if !enable_system_profile_privilege() {
@@ -303,16 +348,9 @@ mod imp {
                             let now = std::time::Instant::now();
                             pid_map.insert(sport, (pid, now));
                             exe_map.remove(&sport);
-                            if pid_map.len() > 1000 {
-                                pid_map.retain(|_, (_, time)| {
-                                    now.duration_since(*time) < std::time::Duration::from_secs(30)
-                                });
-                            }
-                            if exe_map.len() > 1000 {
-                                exe_map.retain(|_, (_, time)| {
-                                    now.duration_since(*time) < std::time::Duration::from_secs(30)
-                                });
-                            }
+                            // Lock ordering: always pid_map → exe_map (consistent with lookup()).
+                            evict_stale_entries(&mut pid_map);
+                            evict_stale_entries(&mut exe_map);
                             log::debug!("ETW: captured pid={}, sport={}", pid, sport);
                             drop(pid_map);
                             drop(exe_map);
@@ -330,12 +368,9 @@ mod imp {
                         log::debug!("ETW: trace session started successfully");
                         // Keep _t alive so the trace runs for the program lifetime.
                         // The thread will be terminated on process exit (process::exit(0)).
-                        // We use a loop here to handle spurious wakeups of std::thread::park().
-                        // Since no other thread calls unpark() on this thread, any wakeup is spurious,
-                        // and wrapping it in a loop prevents the trace handle `_t` from being prematurely dropped.
-                        loop {
-                            std::thread::park();
-                        }
+                        // Use a long sleep instead of `loop { park() }` to avoid
+                        // busy-looping on spurious wakeups (Issue 19).
+                        std::thread::sleep(std::time::Duration::from_secs(u64::MAX));
                     }
                     Err(e) => {
                         let _ = tx.send(false);
@@ -351,7 +386,6 @@ mod imp {
     // ── SeSystemProfilePrivilege ─────────────────────────────────────────
 
     fn enable_system_profile_privilege() -> bool {
-        use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Security::{
             AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
             TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -359,17 +393,18 @@ mod imp {
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
         unsafe {
-            let mut token = windows::Win32::Foundation::HANDLE::default();
+            let mut raw = windows::Win32::Foundation::HANDLE::default();
             if OpenProcessToken(
                 GetCurrentProcess(),
                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                &mut token,
+                &mut raw,
             )
             .is_err()
             {
                 log::debug!("ETW: OpenProcessToken failed");
                 return false;
             }
+            let token = super::SafeHandle(raw);
 
             let mut luid = std::mem::zeroed();
             if LookupPrivilegeValueW(
@@ -380,7 +415,6 @@ mod imp {
             .is_err()
             {
                 log::debug!("ETW: LookupPrivilegeValueW failed");
-                let _ = CloseHandle(token);
                 return false;
             }
 
@@ -391,10 +425,8 @@ mod imp {
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-            let ret = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
-            if let Err(e) = CloseHandle(token) {
-                log::warn!("ETW: CloseHandle failed: {:?}", e);
-            }
+            let ret = AdjustTokenPrivileges(token.0, false, Some(&tp), 0, None, None);
+            // token dropped here → CloseHandle called automatically.
 
             if ret.is_err() {
                 log::debug!("ETW: AdjustTokenPrivileges failed: {:?}", ret);
@@ -448,7 +480,8 @@ mod imp {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
+    use super::evict_stale_entries;
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -467,62 +500,52 @@ mod imp {
         }
 
         pub async fn lookup(&self, remote_port: u16) -> Option<String> {
+            // Fast path: already-resolved cache.
             if let Some((exe, _)) = self.port_to_exe.lock().get(&remote_port).cloned() {
                 return Some(exe);
             }
 
+            // Check if we already have a cached PID from a previous netstat lookup.
             let cached_pid = self
                 .port_to_pid
                 .lock()
                 .get(&remote_port)
                 .map(|(pid, _)| *pid);
             if let Some(pid) = cached_pid {
-                let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
-                    .await
-                    .ok()??;
-                let pid_map = self.port_to_pid.lock();
-                if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
-                    let mut exe_map = self.port_to_exe.lock();
-                    exe_map.insert(remote_port, (exe.clone(), Instant::now()));
-                    if exe_map.len() > 1000 {
-                        let now = Instant::now();
-                        exe_map.retain(|_, (_, time)| {
-                            now.duration_since(*time) < Duration::from_secs(30)
-                        });
-                    }
-                }
-                return Some(exe);
+                return self.resolve_and_cache_pid(remote_port, pid).await;
             }
 
+            // Fallback: scan TCP connection table (blocking OS call).
             let listen_port = self.listen_port;
-            let result = tokio::task::spawn_blocking(move || {
+            let pid = tokio::task::spawn_blocking(move || {
                 super::netstat_fallback::lookup_port_to_pid(listen_port, remote_port)
             })
             .await
             .ok()??;
 
+            // Cache the PID so future lookups on this port avoid another scan.
             {
                 let mut pid_map = self.port_to_pid.lock();
-                pid_map.insert(remote_port, (result, Instant::now()));
-                if pid_map.len() > 1000 {
-                    let now = Instant::now();
-                    pid_map
-                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
-                }
+                pid_map.insert(remote_port, (pid, Instant::now()));
+                evict_stale_entries(&mut pid_map);
             }
 
-            let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(result))
+            self.resolve_and_cache_pid(remote_port, pid).await
+        }
+
+        /// Resolve PID → exe name and cache the result if the PID is still current.
+        ///
+        /// Lock ordering: always `port_to_pid` → `port_to_exe` (Issue 6).
+        async fn resolve_and_cache_pid(&self, remote_port: u16, pid: u32) -> Option<String> {
+            let exe = tokio::task::spawn_blocking(move || super::resolve_pid_to_exe(pid))
                 .await
                 .ok()??;
+            // Only cache if the PID hasn't changed since we started resolving.
             let pid_map = self.port_to_pid.lock();
-            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(result) {
+            if pid_map.get(&remote_port).map(|(p, _)| *p) == Some(pid) {
                 let mut exe_map = self.port_to_exe.lock();
                 exe_map.insert(remote_port, (exe.clone(), Instant::now()));
-                if exe_map.len() > 1000 {
-                    let now = Instant::now();
-                    exe_map
-                        .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(30));
-                }
+                evict_stale_entries(&mut exe_map);
             }
             Some(exe)
         }

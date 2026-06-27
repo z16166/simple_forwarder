@@ -6,6 +6,10 @@ use tokio::time::{Duration, timeout};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Initial buffer size for reading HTTP CONNECT response headers.
+const CONNECT_RESPONSE_INITIAL_BUF_SIZE: usize = 1024;
+/// Maximum allowed length of HTTP CONNECT response headers (bytes).
+const CONNECT_RESPONSE_MAX_LEN: usize = 8192;
 
 fn get_socks5_error(code: u8) -> &'static str {
     match code {
@@ -27,6 +31,16 @@ pub enum ProxyType {
     Socks5,
     Socks5h,
     Http,
+}
+
+impl std::fmt::Display for ProxyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyType::Socks5 => f.write_str("socks5"),
+            ProxyType::Socks5h => f.write_str("socks5h"),
+            ProxyType::Http => f.write_str("http"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +97,8 @@ impl ProxyClient {
             .await
             .with_context(|| format!("Proxy connection timed out: {}", self.config.addr))?
             .with_context(|| format!("Failed to connect to proxy {}", self.config.addr))?;
+        // TCP_NODELAY for lower latency on proxy connections (Issue 18).
+        let _ = stream.set_nodelay(true);
 
         let should_resolve = match self.config.proxy_type {
             ProxyType::Socks5 => true,
@@ -273,7 +289,7 @@ Host: {formatted_host}:{port}\r\n\
         stream.write_all(connect_request.as_bytes()).await?;
 
         // Peek-based buffered HTTP response header reader to avoid byte-by-byte reads
-        let mut buf = vec![0u8; 1024];
+        let mut buf = vec![0u8; CONNECT_RESPONSE_INITIAL_BUF_SIZE];
         let mut total_peeked = 0;
         let header_len = loop {
             let n = stream.peek(&mut buf[total_peeked..]).await?;
@@ -283,11 +299,11 @@ Host: {formatted_host}:{port}\r\n\
                 ));
             }
             total_peeked += n;
-            if let Some(pos) = find_header_separator(&buf[..total_peeked]) {
+            if let Some(pos) = crate::util::find_header_separator(&buf[..total_peeked], 0) {
                 break pos;
             }
             if total_peeked >= buf.len() {
-                if buf.len() >= 8192 {
+                if buf.len() >= CONNECT_RESPONSE_MAX_LEN {
                     return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
                 }
                 buf.resize(buf.len() * 2, 0u8);
@@ -300,33 +316,33 @@ Host: {formatted_host}:{port}\r\n\
 
         let response_str = String::from_utf8_lossy(&response);
         let status_line = response_str.lines().next().unwrap_or("");
-        if status_line.contains(" 200") {
+        // Issue 26: validate that the status line looks like a valid HTTP response.
+        // A minimal HTTP/1.x status line is "HTTP/1.x NNN ..." (at least 12 chars).
+        if status_line.len() < 12 || !status_line.starts_with("HTTP/") {
+            return Err(anyhow::anyhow!(
+                "Invalid HTTP CONNECT response: {}",
+                status_line.trim()
+            ));
+        }
+        // Parse the HTTP status code precisely (Issue 5).
+        // Using `contains(" 200")` would falsely match "2000" or other substrings.
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if status_code == 200 {
             Ok(())
         } else {
             Err(anyhow::anyhow!(
-                "HTTP CONNECT failed: {}",
+                "HTTP CONNECT failed (status {}): {}",
+                status_code,
                 status_line.trim()
             ))
         }
     }
 }
 
-fn find_header_separator(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 2 {
-        return None;
-    }
-    for i in 0..buf.len() - 1 {
-        if buf[i] == b'\n' {
-            if buf[i + 1] == b'\n' {
-                return Some(i + 2);
-            }
-            if i + 2 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
-                return Some(i + 3);
-            }
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod tests {

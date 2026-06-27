@@ -10,6 +10,7 @@ mod proxy_server;
 mod stats;
 mod traffic_window;
 mod tray;
+mod util;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -29,8 +30,8 @@ async fn main() -> Result<()> {
             use windows::core::HSTRING;
             let _ = MessageBoxW(
                 None,
-                &HSTRING::from(format!("Simple Forwarder failed to start:\n\n{}", e)),
-                &HSTRING::from("Simple Forwarder - Startup Error"),
+                &HSTRING::from(format!("{} failed to start:\n\n{}", tray::APP_NAME, e)),
+                &HSTRING::from(&format!("{} - Startup Error", tray::APP_NAME)),
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -53,9 +54,9 @@ async fn run_app() -> Result<()> {
                 let _ = MessageBoxW(
                     None,
                     &HSTRING::from(
-                        "Another instance of Simple Forwarder is already running.\n\nPlease check the system tray.",
+                        format!("Another instance of {} is already running.\n\nPlease check the system tray.", tray::APP_NAME),
                     ),
-                    &HSTRING::from("Simple Forwarder - Already Running"),
+                    &HSTRING::from(&format!("{} - Already Running", tray::APP_NAME)),
                     MB_OK | MB_ICONWARNING,
                 );
             }
@@ -109,13 +110,15 @@ async fn run_app() -> Result<()> {
     let rules_for_watcher = rules_arc.clone();
     let config_path_for_watcher = config_path.to_path_buf();
 
+    // Issue 11: use try_send instead of blocking_send to avoid blocking the
+    // notify callback thread if the channel is full (capacity=1).
     let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res
             && event.kind.is_modify()
         {
-            let _ = watch_tx.blocking_send(());
+            let _ = watch_tx.try_send(());
         }
     })?;
 
@@ -129,15 +132,23 @@ async fn run_app() -> Result<()> {
             // Small delay to ensure file is completely written
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-            match Config::from_file(&config_path_for_watcher).await {
-                Ok(new_config) => match parse_rules(&new_config) {
+            // Issue 11: wrap config reload in a timeout to prevent hanging
+            // if the file is on a network share or locked.
+            let reload_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                Config::from_file(&config_path_for_watcher),
+            ).await;
+
+            match reload_result {
+                Ok(Ok(new_config)) => match parse_rules(&new_config) {
                     Ok(new_rules) => {
                         rules_for_watcher.store(Arc::new(new_rules));
                         log::info!("Rules reloaded successfully");
                     }
                     Err(e) => log::error!("Failed to parse new rules: {}", e),
                 },
-                Err(e) => log::error!("Failed to reload config: {}", e),
+                Ok(Err(e)) => log::error!("Failed to reload config: {}", e),
+                Err(_) => log::error!("Config reload timed out (file may be locked or on network share)"),
             }
         }
     });

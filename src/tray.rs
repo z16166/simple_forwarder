@@ -10,6 +10,21 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
 };
 
+/// Interval between traffic activity checks (ms).
+const ACTIVITY_CHECK_INTERVAL_MS: u64 = 500;
+/// Minimum interval between tooltip hover updates (ms) to avoid flooding.
+const HOVER_THROTTLE_INTERVAL_MS: u64 = 200;
+/// Fallback timeout for graceful shutdown before forcing exit (seconds).
+const FORCE_EXIT_TIMEOUT_SECS: u64 = 3;
+/// Buffer size for registry path queries (wide characters).
+const REGISTRY_BUFFER_SIZE: usize = 1024;
+
+/// Application display name, used in tooltips and dialogs.
+// Issue 7: All UI strings are currently hardcoded in English. To support i18n,
+// consider using the `fluent` or `rust-i18n` crate and moving display strings
+// to a localization table (e.g. `locales/en.toml`, `locales/zh.toml`).
+pub(crate) const APP_NAME: &str = "Simple Forwarder";
+
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::GetLongPathNameW;
 #[cfg(windows)]
@@ -24,6 +39,35 @@ use windows::core::PCWSTR;
 const RUN_REGISTRY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
 #[cfg(windows)]
 const REG_APP_NAME: &str = "SimpleForwarder\0";
+
+/// Post a WM_USER+1 message to the message loop thread to update the tray icon (Issue 24).
+/// `active` = true → show active icon, false → show inactive icon.
+#[cfg(windows)]
+fn post_icon_update(tid_source: &Arc<AtomicU32>, active: bool) {
+    let tid = tid_source.load(Ordering::Acquire);
+    if tid != 0 {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+            let success = PostThreadMessageW(
+                tid,
+                WM_USER + 1,
+                windows::Win32::Foundation::WPARAM(active as usize),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+            if let Err(e) = success {
+                log::error!(
+                    "Failed to post icon update message to main thread: {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn post_icon_update(_tid_source: &Arc<AtomicU32>, _active: bool) {
+    // Non-Windows: icon updates are handled through the tray library's native mechanism.
+}
 
 pub struct TrayManager {
     _tray_icon: TrayIcon,
@@ -101,7 +145,7 @@ impl TrayManager {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
-            .with_tooltip("Simple Forwarder\nMemory: Calculating...")
+            .with_tooltip(&format!("{}\nMemory: Calculating...", APP_NAME))
             .with_icon(icon_inactive.clone())
             .build()?;
 
@@ -126,7 +170,7 @@ impl TrayManager {
             log::debug!("Activity detection task started");
 
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(ACTIVITY_CHECK_INTERVAL_MS)).await;
 
                 let active = stats_clone.traffic_active.swap(false, Ordering::Relaxed);
 
@@ -135,58 +179,14 @@ impl TrayManager {
                         currently_active = true;
                         log::debug!("Activity detected, switching icon to active");
                         is_active_clone.store(true, Ordering::Relaxed);
-                        #[cfg(windows)]
-                        {
-                            let tid = thread_id_for_activity.load(Ordering::Acquire);
-                            if tid != 0 {
-                                unsafe {
-                                    use windows::Win32::UI::WindowsAndMessaging::{
-                                        PostThreadMessageW, WM_USER,
-                                    };
-                                    let success = PostThreadMessageW(
-                                        tid,
-                                        WM_USER + 1,
-                                        windows::Win32::Foundation::WPARAM(1),
-                                        windows::Win32::Foundation::LPARAM(0),
-                                    );
-                                    if let Err(e) = success {
-                                        log::error!(
-                                            "Failed to post active message to main thread: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        post_icon_update(&thread_id_for_activity, true);
                     }
                 } else {
                     if currently_active {
                         currently_active = false;
                         log::debug!("Inactivity detected, switching icon to inactive");
                         is_active_clone.store(false, Ordering::Relaxed);
-                        #[cfg(windows)]
-                        {
-                            let tid = thread_id_for_activity.load(Ordering::Acquire);
-                            if tid != 0 {
-                                unsafe {
-                                    use windows::Win32::UI::WindowsAndMessaging::{
-                                        PostThreadMessageW, WM_USER,
-                                    };
-                                    let success = PostThreadMessageW(
-                                        tid,
-                                        WM_USER + 1,
-                                        windows::Win32::Foundation::WPARAM(0),
-                                        windows::Win32::Foundation::LPARAM(0),
-                                    );
-                                    if let Err(e) = success {
-                                        log::error!(
-                                            "Failed to post inactive message to main thread: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        post_icon_update(&thread_id_for_activity, false);
                     }
                 }
             }
@@ -199,8 +199,14 @@ impl TrayManager {
             while let Ok(event) = tray_event_channel.recv() {
                 match event {
                     TrayIconEvent::Enter { .. } | TrayIconEvent::Move { .. }
-                        // Throttle updates to at most once per 200ms to avoid flooding
-                        if last_update.elapsed() > Duration::from_millis(200) => {
+                        // Throttle updates to avoid flooding
+                        if last_update.elapsed() > Duration::from_millis(HOVER_THROTTLE_INTERVAL_MS) => {
+                            // Issue 25: tooltip updates via hover are only implemented on
+                            // Windows because the Win32 message loop (PostThreadMessageW)
+                            // is the only mechanism to asynchronously trigger a tooltip
+                            // refresh. On non-Windows platforms the tray library handles
+                            // native tooltips differently and there is no equivalent
+                            // cross-platform message queue.
                             #[cfg(windows)]
                             {
                                 let tid = tid_for_events.load(Ordering::Acquire);
@@ -254,13 +260,10 @@ impl TrayManager {
     pub fn run_message_loop(&self) {
         #[cfg(windows)]
         {
-            use windows::Win32::Foundation::{LPARAM, WPARAM};
             use windows::Win32::System::Console::GetConsoleWindow;
             use windows::Win32::UI::WindowsAndMessaging::{
-                DestroyIcon, DispatchMessageW, GetMessageW, ICON_BIG, ICON_SMALL,
-                MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, TranslateMessage, WM_SETICON, WM_USER,
+                DestroyIcon, DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_USER,
             };
-            use windows::core::HSTRING;
 
             unsafe {
                 // Store thread ID so tokio tasks can post messages to this thread.
@@ -271,189 +274,25 @@ impl TrayManager {
                 log::debug!("Starting Win32 message loop (thread id={})", tid);
                 let mut hwnd_console = GetConsoleWindow();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    // Check for menu events from the receiver (non-blocking)
+                    // Drain all pending menu events (non-blocking)
                     while let Ok(event) = MenuEvent::receiver().try_recv() {
-                        if event.id == self.quit_id {
-                            log::info!("Quit menu selected");
-                            let tid = self.msg_loop_thread_id.load(Ordering::Acquire);
-                            if tid != 0 {
-                                // Graceful exit from the message loop
-                                use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
-                                let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0));
-                                // Fallback: force exit after 3 seconds if graceful shutdown stalls
-                                std::thread::spawn(|| {
-                                    std::thread::sleep(Duration::from_secs(3));
-                                    log::warn!("Graceful shutdown timed out, forcing exit");
-                                    std::process::exit(1);
-                                });
-                            } else {
-                                std::process::exit(0);
-                            }
-                        } else if event.id == self.autostart_id {
-                            let is_checked = self.autostart_item.is_checked();
-                            log::info!("Toggle Run at Startup: {}", is_checked);
-                            if let Ok(path) = Self::get_quoted_exe_path()
-                                && let Err(e) = Self::set_autostart(&path, is_checked)
-                            {
-                                log::error!("Failed to update autostart registry: {}", e);
-                                // Revert checkbox on failure
-                                self.autostart_item.set_checked(!is_checked);
-                            }
-                        } else if event.id == self.stats_id {
-                            let lock = self.is_dialog_open.clone();
-                            if lock.swap(true, Ordering::SeqCst) {
-                                // Already open
-                                continue;
-                            }
-
-                            let stats = self.stats.clone();
-                            std::thread::spawn(move || {
-                                #[cfg(windows)]
-                                {
-                                    let mem_kb = TrayManager::get_current_memory_usage_kb();
-                                    let mem_formatted = TrayManager::format_with_commas(mem_kb);
-
-                                    let direct_in = TrafficStats::format_bytes(
-                                        stats.direct_rx.load(Ordering::Relaxed),
-                                    );
-                                    let direct_out = TrafficStats::format_bytes(
-                                        stats.direct_tx.load(Ordering::Relaxed),
-                                    );
-                                    let upstream_in = TrafficStats::format_bytes(
-                                        stats.upstream_rx.load(Ordering::Relaxed),
-                                    );
-                                    let upstream_out = TrafficStats::format_bytes(
-                                        stats.upstream_tx.load(Ordering::Relaxed),
-                                    );
-
-                                    let run_time =
-                                        TrayManager::format_duration(stats.start_time.elapsed());
-
-                                    let stats_text = format!(
-                                        "Listen Address: {}\n\
-                                         Run Time: {}\n\
-                                         Memory Usage: {} KB (Private Mapping)\n\n\
-                                         - Direct Traffic -\n\
-                                         Inbound: {}\n\
-                                         Outbound: {}\n\n\
-                                         - Proxy Traffic -\n\
-                                         Inbound: {}\n\
-                                         Outbound: {}",
-                                        stats.listen_addr,
-                                        run_time,
-                                        mem_formatted,
-                                        direct_in,
-                                        direct_out,
-                                        upstream_in,
-                                        upstream_out
-                                    );
-
-                                    MessageBoxW(
-                                        None,
-                                        &HSTRING::from(&stats_text),
-                                        &HSTRING::from("Simple Forwarder Status"),
-                                        MB_OK | MB_ICONINFORMATION,
-                                    );
-                                }
-                                lock.store(false, Ordering::SeqCst);
-                            });
-                        } else if event.id == self.open_dir_id {
-                            if let Ok(exe_path) = std::env::current_exe()
-                                && let Some(exe_dir) = exe_path.parent()
-                                && let Err(e) = open_directory(exe_dir)
-                            {
-                                log::error!("Failed to open program directory: {}", e);
-                            }
-                        } else if event.id == self.traffic_id {
-                            let tracker = self.tracker.clone();
-                            let want_visible = self.is_traffic_open.clone();
-                            let thread_running = self.traffic_thread_running.clone();
-                            traffic_window::open_traffic_window(
-                                tracker,
-                                want_visible,
-                                thread_running,
-                            );
+                        if self.handle_menu_event(&event) {
+                            // Quit requested — break out of message loop.
+                            break;
                         }
                     }
 
-                    // WM_USER+2: graceful quit request from menu handler
                     if msg.message == WM_USER + 2 {
                         log::info!("Quit message received, exiting message loop");
                         break;
+                    } else if msg.message == WM_USER + 1 {
+                        self.handle_icon_update(msg.wParam.0 != 0, &mut hwnd_console);
+                    } else if msg.message == WM_USER + 3 {
+                        let _ = self._tray_icon.set_tooltip(Some(APP_NAME.to_string()));
+                    } else {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
                     }
-
-                    // WM_USER+3: tooltip update request (hover/move)
-                    if msg.message == WM_USER + 3 {
-                        let _ = self
-                            ._tray_icon
-                            .set_tooltip(Some("Simple Forwarder".to_string()));
-                        continue;
-                    }
-
-                    if msg.message == WM_USER + 1 {
-                        let active = msg.wParam.0 != 0;
-                        log::debug!("Received UI update message: active={}", active);
-
-                        // Update Tray Icon using cached icons
-                        let icon = if active {
-                            &self.icon_active
-                        } else {
-                            &self.icon_inactive
-                        };
-                        if let Err(e) = self._tray_icon.set_icon(Some(icon.clone())) {
-                            log::error!("Failed to set tray icon: {}", e);
-                        }
-
-                        // Lazy re-check for console window if not found initially
-                        if hwnd_console.0.is_null() {
-                            hwnd_console = GetConsoleWindow();
-                        }
-
-                        // Update Taskbar Icon (if console exists) using cached hicons
-                        if !hwnd_console.0.is_null() {
-                            let hicon = if active {
-                                self.hicon_active
-                            } else {
-                                self.hicon_inactive
-                            };
-                            use windows::Win32::UI::WindowsAndMessaging::{
-                                GCLP_HICON, GCLP_HICONSM, SendMessageW, SetClassLongPtrW,
-                            };
-
-                            // Try both SendMessage and SetClassLongPtr for maximum compatibility
-                            let _ = SendMessageW(
-                                hwnd_console,
-                                WM_SETICON,
-                                WPARAM(ICON_SMALL as usize),
-                                LPARAM(hicon.0 as isize),
-                            );
-                            let _ = SendMessageW(
-                                hwnd_console,
-                                WM_SETICON,
-                                WPARAM(ICON_BIG as usize),
-                                LPARAM(hicon.0 as isize),
-                            );
-
-                            #[cfg(target_pointer_width = "64")]
-                            {
-                                let _ =
-                                    SetClassLongPtrW(hwnd_console, GCLP_HICON, hicon.0 as isize);
-                                let _ =
-                                    SetClassLongPtrW(hwnd_console, GCLP_HICONSM, hicon.0 as isize);
-                            }
-                            #[cfg(target_pointer_width = "32")]
-                            {
-                                use windows::Win32::UI::WindowsAndMessaging::{
-                                    GCL_HICON, GCL_HICONSM, SetClassLongW,
-                                };
-                                let _ = SetClassLongW(hwnd_console, GCL_HICON, hicon.0 as i32);
-                                let _ = SetClassLongW(hwnd_console, GCL_HICONSM, hicon.0 as i32);
-                            }
-                        }
-                        continue;
-                    }
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
                 }
 
                 // Final cleanup of cached handles
@@ -469,16 +308,174 @@ impl TrayManager {
                         log::info!("Quit menu selected");
                         std::process::exit(0);
                     } else if event.id == self.open_dir_id {
-                        if let Ok(exe_path) = std::env::current_exe() {
-                            if let Some(exe_dir) = exe_path.parent() {
-                                if let Err(e) = open_directory(exe_dir) {
-                                    log::error!("Failed to open program directory: {}", e);
-                                }
-                            }
+                        // Use let-else to reduce nesting (Issue 23).
+                        let Ok(exe_path) = std::env::current_exe() else { continue };
+                        let Some(exe_dir) = exe_path.parent() else { continue };
+                        if let Err(e) = open_directory(exe_dir) {
+                            log::error!("Failed to open program directory: {}", e);
                         }
+                    } else if event.id == self.stats_id {
+                        // Issue 9: handle traffic statistics on non-Windows platforms.
+                        let lock = self.is_dialog_open.clone();
+                        if lock.swap(true, Ordering::SeqCst) {
+                            continue;
+                        }
+                        let stats = self.stats.clone();
+                        std::thread::spawn(move || {
+                            // Non-Windows: log stats to console since there's no MessageBox.
+                            let direct_in = TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
+                            let direct_out = TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
+                            let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
+                            let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
+                            log::info!(
+                                "Traffic Stats — Direct: {}/{} | Proxy: {}/{}",
+                                direct_in, direct_out, upstream_in, upstream_out
+                            );
+                            lock.store(false, Ordering::SeqCst);
+                        });
+                    } else if event.id == self.traffic_id {
+                        // Issue 9: handle real-time traffic window on non-Windows platforms.
+                        let tracker = self.tracker.clone();
+                        let want_visible = self.is_traffic_open.clone();
+                        let thread_running = self.traffic_thread_running.clone();
+                        traffic_window::open_traffic_window(tracker, want_visible, thread_running);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// Handle a single menu event. Returns `true` if quit was requested.
+    #[cfg(windows)]
+    fn handle_menu_event(&self, event: &MenuEvent) -> bool {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER};
+
+        if event.id == self.quit_id {
+            log::info!("Quit menu selected");
+            let tid = self.msg_loop_thread_id.load(Ordering::Acquire);
+            if tid != 0 {
+                unsafe { let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0)); }
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_secs(FORCE_EXIT_TIMEOUT_SECS));
+                    log::warn!("Graceful shutdown timed out, forcing exit");
+                    std::process::exit(1);
+                });
+            } else {
+                std::process::exit(0);
+            }
+            return true;
+        }
+        if event.id == self.autostart_id {
+            let is_checked = self.autostart_item.is_checked();
+            log::info!("Toggle Run at Startup: {}", is_checked);
+            if let Ok(path) = Self::get_quoted_exe_path()
+                && let Err(e) = Self::set_autostart(&path, is_checked)
+            {
+                log::error!("Failed to update autostart registry: {}", e);
+                self.autostart_item.set_checked(!is_checked);
+            }
+            return false;
+        }
+        if event.id == self.stats_id {
+            let lock = self.is_dialog_open.clone();
+            if lock.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+            let stats = self.stats.clone();
+            std::thread::spawn(move || {
+                let mem_kb = TrayManager::get_current_memory_usage_kb();
+                let mem_formatted = TrayManager::format_with_commas(mem_kb);
+                let direct_in = TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
+                let direct_out = TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
+                let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
+                let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
+                let run_time = TrayManager::format_duration(stats.start_time.elapsed());
+                let stats_text = format!(
+                    "Listen Address: {}\n\
+                     Run Time: {}\n\
+                     Memory Usage: {} KB (Private Mapping)\n\n\
+                     - Direct Traffic -\n\
+                     Inbound: {}\n\
+                     Outbound: {}\n\n\
+                     - Proxy Traffic -\n\
+                     Inbound: {}\n\
+                     Outbound: {}",
+                    stats.listen_addr, run_time, mem_formatted,
+                    direct_in, direct_out, upstream_in, upstream_out
+                );
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+                    use windows::core::HSTRING;
+                    MessageBoxW(
+                        None,
+                        &HSTRING::from(&stats_text),
+                        &HSTRING::from(&format!("{} Status", APP_NAME)),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+                lock.store(false, Ordering::SeqCst);
+            });
+            return false;
+        }
+        if event.id == self.open_dir_id {
+            let Ok(exe_path) = std::env::current_exe() else { return false };
+            let Some(exe_dir) = exe_path.parent() else { return false };
+            if let Err(e) = open_directory(exe_dir) {
+                log::error!("Failed to open program directory: {}", e);
+            }
+            return false;
+        }
+        if event.id == self.traffic_id {
+            let tracker = self.tracker.clone();
+            let want_visible = self.is_traffic_open.clone();
+            let thread_running = self.traffic_thread_running.clone();
+            traffic_window::open_traffic_window(tracker, want_visible, thread_running);
+        }
+        false
+    }
+
+    /// Handle WM_USER+1: toggle tray/taskbar icon between active and inactive.
+    #[cfg(windows)]
+    fn handle_icon_update(&self, active: bool, hwnd_console: &mut windows::Win32::Foundation::HWND) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::System::Console::GetConsoleWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, SendMessageW,
+            SetClassLongPtrW, WM_SETICON,
+        };
+
+        log::debug!("Received UI update message: active={}", active);
+
+        let icon = if active { &self.icon_active } else { &self.icon_inactive };
+        if let Err(e) = self._tray_icon.set_icon(Some(icon.clone())) {
+            log::error!("Failed to set tray icon: {}", e);
+        }
+
+        // Lazy re-check for console window if not found initially
+        if hwnd_console.0.is_null() {
+            *hwnd_console = unsafe { GetConsoleWindow() };
+        }
+        if hwnd_console.0.is_null() {
+            return;
+        }
+
+        let hicon = if active { self.hicon_active } else { self.hicon_inactive };
+        unsafe {
+            let _ = SendMessageW(*hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+            let _ = SendMessageW(*hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+
+            #[cfg(target_pointer_width = "64")]
+            {
+                let _ = SetClassLongPtrW(*hwnd_console, GCLP_HICON, hicon.0 as isize);
+                let _ = SetClassLongPtrW(*hwnd_console, GCLP_HICONSM, hicon.0 as isize);
+            }
+            #[cfg(target_pointer_width = "32")]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{GCL_HICON, GCL_HICONSM, SetClassLongW};
+                let _ = SetClassLongW(*hwnd_console, GCL_HICON, hicon.0 as i32);
+                let _ = SetClassLongW(*hwnd_console, GCL_HICONSM, hicon.0 as i32);
             }
         }
     }
@@ -517,10 +514,11 @@ impl TrayManager {
                 hbmColor: h_bm_color,
             };
 
-            let hicon = CreateIconIndirect(&icon_info)?;
-
+            // Issue 8: always clean up GDI bitmaps, even if CreateIconIndirect fails.
+            let result = CreateIconIndirect(&icon_info);
             let _ = DeleteObject(h_bm_color);
             let _ = DeleteObject(h_bm_mask);
+            let hicon = result?;
 
             Ok(hicon)
         }
@@ -636,7 +634,7 @@ impl TrayManager {
 
         // Convert to long path name to ensure registry consistency
         let wide_path: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut buffer = [0u16; 1024];
+        let mut buffer = [0u16; REGISTRY_BUFFER_SIZE];
         let len = unsafe { GetLongPathNameW(PCWSTR(wide_path.as_ptr()), Some(&mut buffer)) };
 
         let final_path = if len > 0 && (len as usize) < buffer.len() {
@@ -667,7 +665,7 @@ impl TrayManager {
             }
 
             let value_name: Vec<u16> = REG_APP_NAME.encode_utf16().collect();
-            let mut buffer = [0u16; 1024];
+            let mut buffer = [0u16; REGISTRY_BUFFER_SIZE];
             let mut len = (buffer.len() * 2) as u32;
             let mut dw_type = windows::Win32::System::Registry::REG_VALUE_TYPE::default();
 
