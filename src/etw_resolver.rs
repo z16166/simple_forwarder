@@ -167,6 +167,13 @@ mod imp {
     #[derive(Clone)]
     pub struct ExeResolver {
         /// PID source: populated by ETW callback (cheap, no syscalls).
+        ///
+        /// We use `parking_lot::Mutex` (a synchronous lock) even though this
+        /// struct is accessed from `async fn lookup()`. This is intentional:
+        /// - The critical sections are in-memory HashMap operations (nanoseconds).
+        /// - The lock is never held across an `.await` point.
+        /// - Per tokio docs, `tokio::sync::Mutex` is for I/O resources; for
+        ///   in-memory data, a blocking mutex (parking_lot / std) is preferred.
         port_to_pid: Arc<Mutex<HashMap<u16, (u32, Instant)>>>,
         /// Resolved exe name cache.
         port_to_exe: Arc<Mutex<HashMap<u16, (String, Instant)>>>,
@@ -488,6 +495,10 @@ mod imp {
 
     #[derive(Clone)]
     pub struct ExeResolver {
+        /// Cache of PID lookups.
+        ///
+        /// Uses `parking_lot::Mutex` intentionally — see the same note on the
+        /// Windows `ExeResolver` struct above for rationale.
         port_to_pid: Arc<Mutex<HashMap<u16, (u32, Instant)>>>,
         port_to_exe: Arc<Mutex<HashMap<u16, (String, Instant)>>>,
         listen_port: u16,
