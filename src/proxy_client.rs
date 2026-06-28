@@ -343,7 +343,6 @@ Host: {formatted_host}:{port}\r\n\
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

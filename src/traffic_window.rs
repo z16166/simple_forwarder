@@ -250,7 +250,12 @@ fn run_traffic_window(
         }
     }
 
-    let mut window = Window::new(&ui, "Real-time Traffic", 1100, 500, WindowType::NoMenubar);
+    let title = if crate::is_admin() {
+        "Real-time Traffic (Administrator)"
+    } else {
+        "Real-time Traffic"
+    };
+    let mut window = Window::new(&ui, title, 1100, 500, WindowType::NoMenubar);
     window.set_margined(true);
     window.set_child(table);
 

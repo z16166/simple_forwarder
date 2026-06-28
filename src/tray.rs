@@ -55,10 +55,7 @@ fn post_icon_update(tid_source: &Arc<AtomicU32>, active: bool) {
                 windows::Win32::Foundation::LPARAM(0),
             );
             if let Err(e) = success {
-                log::error!(
-                    "Failed to post icon update message to main thread: {}",
-                    e
-                );
+                log::error!("Failed to post icon update message to main thread: {}", e);
             }
         }
     }
@@ -309,8 +306,12 @@ impl TrayManager {
                         std::process::exit(0);
                     } else if event.id == self.open_dir_id {
                         // Use let-else to reduce nesting (Issue 23).
-                        let Ok(exe_path) = std::env::current_exe() else { continue };
-                        let Some(exe_dir) = exe_path.parent() else { continue };
+                        let Ok(exe_path) = std::env::current_exe() else {
+                            continue;
+                        };
+                        let Some(exe_dir) = exe_path.parent() else {
+                            continue;
+                        };
                         if let Err(e) = open_directory(exe_dir) {
                             log::error!("Failed to open program directory: {}", e);
                         }
@@ -323,13 +324,22 @@ impl TrayManager {
                         let stats = self.stats.clone();
                         std::thread::spawn(move || {
                             // Non-Windows: log stats to console since there's no MessageBox.
-                            let direct_in = TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
-                            let direct_out = TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
-                            let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
-                            let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
+                            let direct_in =
+                                TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
+                            let direct_out =
+                                TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
+                            let upstream_in = TrafficStats::format_bytes(
+                                stats.upstream_rx.load(Ordering::Relaxed),
+                            );
+                            let upstream_out = TrafficStats::format_bytes(
+                                stats.upstream_tx.load(Ordering::Relaxed),
+                            );
                             log::info!(
                                 "Traffic Stats — Direct: {}/{} | Proxy: {}/{}",
-                                direct_in, direct_out, upstream_in, upstream_out
+                                direct_in,
+                                direct_out,
+                                upstream_in,
+                                upstream_out
                             );
                             lock.store(false, Ordering::SeqCst);
                         });
@@ -356,7 +366,9 @@ impl TrayManager {
             log::info!("Quit menu selected");
             let tid = self.msg_loop_thread_id.load(Ordering::Acquire);
             if tid != 0 {
-                unsafe { let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0)); }
+                unsafe {
+                    let _ = PostThreadMessageW(tid, WM_USER + 2, WPARAM(0), LPARAM(0));
+                }
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_secs(FORCE_EXIT_TIMEOUT_SECS));
                     log::warn!("Graceful shutdown timed out, forcing exit");
@@ -388,25 +400,43 @@ impl TrayManager {
                 let mem_kb = TrayManager::get_current_memory_usage_kb();
                 let mem_formatted = TrayManager::format_with_commas(mem_kb);
                 let direct_in = TrafficStats::format_bytes(stats.direct_rx.load(Ordering::Relaxed));
-                let direct_out = TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
-                let upstream_in = TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
-                let upstream_out = TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
+                let direct_out =
+                    TrafficStats::format_bytes(stats.direct_tx.load(Ordering::Relaxed));
+                let upstream_in =
+                    TrafficStats::format_bytes(stats.upstream_rx.load(Ordering::Relaxed));
+                let upstream_out =
+                    TrafficStats::format_bytes(stats.upstream_tx.load(Ordering::Relaxed));
                 let run_time = TrayManager::format_duration(stats.start_time.elapsed());
+                let admin_line = if crate::is_admin() {
+                    "Privilege: Administrator\n"
+                } else {
+                    ""
+                };
                 let stats_text = format!(
                     "Listen Address: {}\n\
                      Run Time: {}\n\
-                     Memory Usage: {} KB (Private Mapping)\n\n\
+                     Memory Usage: {} KB (Private Mapping)\n\
+                     {}\
+                     \n\
                      - Direct Traffic -\n\
                      Inbound: {}\n\
                      Outbound: {}\n\n\
                      - Proxy Traffic -\n\
                      Inbound: {}\n\
                      Outbound: {}",
-                    stats.listen_addr, run_time, mem_formatted,
-                    direct_in, direct_out, upstream_in, upstream_out
+                    stats.listen_addr,
+                    run_time,
+                    mem_formatted,
+                    admin_line,
+                    direct_in,
+                    direct_out,
+                    upstream_in,
+                    upstream_out
                 );
                 unsafe {
-                    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        MB_ICONINFORMATION, MB_OK, MessageBoxW,
+                    };
                     use windows::core::HSTRING;
                     MessageBoxW(
                         None,
@@ -420,8 +450,12 @@ impl TrayManager {
             return false;
         }
         if event.id == self.open_dir_id {
-            let Ok(exe_path) = std::env::current_exe() else { return false };
-            let Some(exe_dir) = exe_path.parent() else { return false };
+            let Ok(exe_path) = std::env::current_exe() else {
+                return false;
+            };
+            let Some(exe_dir) = exe_path.parent() else {
+                return false;
+            };
             if let Err(e) = open_directory(exe_dir) {
                 log::error!("Failed to open program directory: {}", e);
             }
@@ -438,17 +472,25 @@ impl TrayManager {
 
     /// Handle WM_USER+1: toggle tray/taskbar icon between active and inactive.
     #[cfg(windows)]
-    fn handle_icon_update(&self, active: bool, hwnd_console: &mut windows::Win32::Foundation::HWND) {
+    fn handle_icon_update(
+        &self,
+        active: bool,
+        hwnd_console: &mut windows::Win32::Foundation::HWND,
+    ) {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::System::Console::GetConsoleWindow;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, SendMessageW,
-            SetClassLongPtrW, WM_SETICON,
+            GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, SendMessageW, SetClassLongPtrW,
+            WM_SETICON,
         };
 
         log::debug!("Received UI update message: active={}", active);
 
-        let icon = if active { &self.icon_active } else { &self.icon_inactive };
+        let icon = if active {
+            &self.icon_active
+        } else {
+            &self.icon_inactive
+        };
         if let Err(e) = self._tray_icon.set_icon(Some(icon.clone())) {
             log::error!("Failed to set tray icon: {}", e);
         }
@@ -461,10 +503,24 @@ impl TrayManager {
             return;
         }
 
-        let hicon = if active { self.hicon_active } else { self.hicon_inactive };
+        let hicon = if active {
+            self.hicon_active
+        } else {
+            self.hicon_inactive
+        };
         unsafe {
-            let _ = SendMessageW(*hwnd_console, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
-            let _ = SendMessageW(*hwnd_console, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+            let _ = SendMessageW(
+                *hwnd_console,
+                WM_SETICON,
+                WPARAM(ICON_SMALL as usize),
+                LPARAM(hicon.0 as isize),
+            );
+            let _ = SendMessageW(
+                *hwnd_console,
+                WM_SETICON,
+                WPARAM(ICON_BIG as usize),
+                LPARAM(hicon.0 as isize),
+            );
 
             #[cfg(target_pointer_width = "64")]
             {
@@ -473,7 +529,9 @@ impl TrayManager {
             }
             #[cfg(target_pointer_width = "32")]
             {
-                use windows::Win32::UI::WindowsAndMessaging::{GCL_HICON, GCL_HICONSM, SetClassLongW};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GCL_HICON, GCL_HICONSM, SetClassLongW,
+                };
                 let _ = SetClassLongW(*hwnd_console, GCL_HICON, hicon.0 as i32);
                 let _ = SetClassLongW(*hwnd_console, GCL_HICONSM, hicon.0 as i32);
             }

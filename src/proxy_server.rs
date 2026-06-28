@@ -304,7 +304,10 @@ async fn handle_socks4(
     };
     // Issue 26: validate individual field lengths.
     if u_end > 255 {
-        return Err(anyhow::anyhow!("SOCKS4: User ID too long ({} bytes)", u_end));
+        return Err(anyhow::anyhow!(
+            "SOCKS4: User ID too long ({} bytes)",
+            u_end
+        ));
     }
     let _user_id = buf.split_to(u_end + 1).freeze();
 
@@ -315,7 +318,10 @@ async fn handle_socks4(
         let domain_len = d_end - (u_end + 1);
         // DNS name limit is 253 characters (RFC 1035).
         if domain_len > 253 {
-            return Err(anyhow::anyhow!("SOCKS4a: domain name too long ({} bytes)", domain_len));
+            return Err(anyhow::anyhow!(
+                "SOCKS4a: domain name too long ({} bytes)",
+                domain_len
+            ));
         }
         let domain = buf.split_to(domain_len + 1).freeze();
         String::from_utf8_lossy(&domain[..domain_len]).to_string()
@@ -350,7 +356,11 @@ async fn handle_socks4(
 
     send_socks4_reply(&mut stream, 0x5A).await?;
 
-    let proto = if is_socks4a { Protocol::Socks4a } else { Protocol::Socks4 };
+    let proto = if is_socks4a {
+        Protocol::Socks4a
+    } else {
+        Protocol::Socks4
+    };
     Ok(HandshakeResult {
         client_stream: stream,
         target_stream,
@@ -463,7 +473,11 @@ async fn handle_socks5(
 
     send_success_reply(&mut stream).await?;
 
-    let proto = if resolve_hostname { Protocol::Socks5h } else { Protocol::Socks5 };
+    let proto = if resolve_hostname {
+        Protocol::Socks5h
+    } else {
+        Protocol::Socks5
+    };
     Ok(HandshakeResult {
         client_stream: stream,
         target_stream,
@@ -772,11 +786,7 @@ struct RelayContext {
     bytes_received: Arc<std::sync::atomic::AtomicU64>,
 }
 
-async fn relay_data(
-    stream: TcpStream,
-    target_stream: TcpStream,
-    ctx: RelayContext,
-) -> Result<()> {
+async fn relay_data(stream: TcpStream, target_stream: TcpStream, ctx: RelayContext) -> Result<()> {
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
 
@@ -784,7 +794,12 @@ async fn relay_data(
         if !ctx.leftover.is_empty() {
             timeout(WRITE_TIMEOUT, target_writer.write_all(&ctx.leftover))
                 .await
-                .map_err(|_| anyhow::anyhow!("Target leftover write timeout ({}s)", WRITE_TIMEOUT.as_secs()))??;
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Target leftover write timeout ({}s)",
+                        WRITE_TIMEOUT.as_secs()
+                    )
+                })??;
             if ctx.is_direct {
                 ctx.stats
                     .direct_tx
@@ -794,7 +809,8 @@ async fn relay_data(
                     .upstream_tx
                     .fetch_add(ctx.leftover.len() as u64, Ordering::Relaxed);
             }
-            ctx.bytes_sent.fetch_add(ctx.leftover.len() as u64, Ordering::Relaxed);
+            ctx.bytes_sent
+                .fetch_add(ctx.leftover.len() as u64, Ordering::Relaxed);
             ctx.stats.traffic_active.store(true, Ordering::Relaxed);
         }
         let mut buf = [0u8; RELAY_BUF_SIZE];
@@ -804,7 +820,9 @@ async fn relay_data(
                 Ok(Ok(n)) => {
                     timeout(WRITE_TIMEOUT, target_writer.write_all(&buf[..n]))
                         .await
-                        .map_err(|_| anyhow::anyhow!("Target write timeout ({}s)", WRITE_TIMEOUT.as_secs()))??;
+                        .map_err(|_| {
+                            anyhow::anyhow!("Target write timeout ({}s)", WRITE_TIMEOUT.as_secs())
+                        })??;
                     if ctx.is_direct {
                         ctx.stats.direct_tx.fetch_add(n as u64, Ordering::Relaxed);
                     } else {
@@ -829,7 +847,9 @@ async fn relay_data(
                 Ok(Ok(n)) => {
                     timeout(WRITE_TIMEOUT, client_writer.write_all(&buf[..n]))
                         .await
-                        .map_err(|_| anyhow::anyhow!("Client write timeout ({}s)", WRITE_TIMEOUT.as_secs()))??;
+                        .map_err(|_| {
+                            anyhow::anyhow!("Client write timeout ({}s)", WRITE_TIMEOUT.as_secs())
+                        })??;
                     if ctx.is_direct {
                         ctx.stats.direct_rx.fetch_add(n as u64, Ordering::Relaxed);
                     } else {
@@ -909,7 +929,12 @@ async fn relay_data(
         }
     }
 
-    log::debug!("Connection from {} to {}:{} closed", ctx.peer_addr, ctx.host, ctx.port);
+    log::debug!(
+        "Connection from {} to {}:{} closed",
+        ctx.peer_addr,
+        ctx.host,
+        ctx.port
+    );
     Ok(())
 }
 
