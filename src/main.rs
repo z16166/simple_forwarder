@@ -20,8 +20,62 @@ use notify::{RecursiveMode, Watcher};
 use proxy_client::ProxyConfig;
 use proxy_server::ProxyServer;
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Cached result of whether this process is running with administrator
+/// privileges (UAC-elevated token, or UAC disabled + admin token).
+/// Determined once at startup and never changes.
+static IS_ADMIN: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` if the process is running with administrator privileges.
+pub(crate) fn is_admin() -> bool {
+    *IS_ADMIN.get_or_init(|| false)
+}
+
+/// Detect whether the current process token has administrator privileges.
+///
+/// Uses `CheckTokenMembership` with the built-in Administrators SID, which
+/// correctly handles both UAC-elevated tokens and the case where UAC is
+/// disabled but the user is a member of the local Administrators group.
+#[cfg(windows)]
+fn detect_admin() -> bool {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, PSID, SECURITY_NT_AUTHORITY,
+    };
+
+    unsafe {
+        // Build the well-known SID for the local Administrators group:
+        // S-1-5-32-544
+        let mut sid = PSID(std::ptr::null_mut());
+        let authority = SECURITY_NT_AUTHORITY;
+        let ok = AllocateAndInitializeSid(
+            &authority, 2,          // sub-authority count
+            0x00000020, // SECURITY_BUILTIN_RID
+            0x00000220, // DOMAIN_ALIAS_RID_ADMINS
+            0, 0, 0, 0, 0, 0, &mut sid,
+        );
+        if ok.is_err() {
+            return false;
+        }
+
+        let mut is_member = BOOL(0);
+        let result = CheckTokenMembership(None, sid, &mut is_member);
+        FreeSid(sid);
+        result.is_ok() && is_member.as_bool()
+    }
+}
+
+#[cfg(not(windows))]
+fn detect_admin() -> bool {
+    false
+}
 
 fn main() {
+    // Determine admin privileges once at startup so the rest of the app
+    // can query `is_admin()` without re-checking.
+    let _ = IS_ADMIN.set(detect_admin());
+
     // Build the tokio runtime manually instead of using #[tokio::main] so
     // the main thread is NOT a tokio worker. This lets us run the Win32
     // message loop (GetMessageW) on the main thread without consuming a
@@ -97,9 +151,10 @@ async fn run_app_init() -> Result<(AppGuard, tray::TrayManager, etw_resolver::Ex
                 use windows::core::HSTRING;
                 let _ = MessageBoxW(
                     None,
-                    &HSTRING::from(
-                        format!("Another instance of {} is already running.\n\nPlease check the system tray.", tray::APP_NAME),
-                    ),
+                    &HSTRING::from(format!(
+                        "Another instance of {} is already running.\n\nPlease check the system tray.",
+                        tray::APP_NAME
+                    )),
                     &HSTRING::from(&format!("{} - Already Running", tray::APP_NAME)),
                     MB_OK | MB_ICONWARNING,
                 );
@@ -181,7 +236,8 @@ async fn run_app_init() -> Result<(AppGuard, tray::TrayManager, etw_resolver::Ex
             let reload_result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(5),
                 Config::from_file(&config_path_for_watcher),
-            ).await;
+            )
+            .await;
 
             match reload_result {
                 Ok(Ok(new_config)) => match parse_rules(&new_config) {
@@ -192,7 +248,9 @@ async fn run_app_init() -> Result<(AppGuard, tray::TrayManager, etw_resolver::Ex
                     Err(e) => log::error!("Failed to parse new rules: {}", e),
                 },
                 Ok(Err(e)) => log::error!("Failed to reload config: {}", e),
-                Err(_) => log::error!("Config reload timed out (file may be locked or on network share)"),
+                Err(_) => {
+                    log::error!("Config reload timed out (file may be locked or on network share)")
+                }
             }
         }
     });

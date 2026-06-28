@@ -26,7 +26,9 @@ impl SafeHandle {
 impl Drop for SafeHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
-            unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); }
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
         }
     }
 }
@@ -42,7 +44,8 @@ fn resolve_pid_to_exe(pid: u32) -> Option<String> {
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
 
-    let raw = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+    let raw =
+        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
     let handle = SafeHandle(raw);
     if handle.is_invalid() {
         return None;
@@ -161,8 +164,8 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use super::{ETW_SESSION_NAME, evict_stale_entries};
     use std::time::Instant;
-    use super::{evict_stale_entries, ETW_SESSION_NAME};
 
     #[derive(Clone)]
     pub struct ExeResolver {
@@ -487,11 +490,11 @@ pub use imp::ExeResolver;
 
 #[cfg(not(windows))]
 mod imp {
+    use super::evict_stale_entries;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
-    use super::evict_stale_entries;
 
     #[derive(Clone)]
     pub struct ExeResolver {
