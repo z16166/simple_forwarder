@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -92,7 +92,7 @@ impl ProxyClient {
         host: &str,
         port: u16,
         resolve_hostname: bool,
-    ) -> Result<TcpStream> {
+    ) -> Result<(TcpStream, Bytes)> {
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&self.config.addr))
             .await
             .with_context(|| format!("Proxy connection timed out: {}", self.config.addr))?
@@ -123,28 +123,34 @@ impl ProxyClient {
             host.to_string()
         };
 
-        let handshake_result = match self.config.proxy_type {
+        let target_leftover = match self.config.proxy_type {
             ProxyType::Socks5 | ProxyType::Socks5h => {
-                timeout(
+                match timeout(
                     HANDSHAKE_TIMEOUT,
                     self.socks5_connect(&mut stream, &final_host, port, !should_resolve),
                 )
                 .await
+                {
+                    Ok(Ok(())) => Bytes::new(),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(anyhow::anyhow!("Handshake with proxy timed out")),
+                }
             }
             ProxyType::Http => {
-                timeout(
+                match timeout(
                     HANDSHAKE_TIMEOUT,
                     self.http_connect(&mut stream, &final_host, port),
                 )
                 .await
+                {
+                    Ok(Ok(leftover)) => leftover,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(anyhow::anyhow!("Handshake with proxy timed out")),
+                }
             }
         };
 
-        match handshake_result {
-            Ok(Ok(_)) => Ok(stream),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow::anyhow!("Handshake with proxy timed out")),
-        }
+        Ok((stream, target_leftover))
     }
 
     async fn socks5_connect(
@@ -266,7 +272,7 @@ impl ProxyClient {
         Ok(())
     }
 
-    async fn http_connect(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<()> {
+    async fn http_connect(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<Bytes> {
         log::debug!(
             "HTTP CONNECT to {}:{} via proxy {}",
             host,
@@ -288,31 +294,39 @@ Host: {formatted_host}:{port}\r\n\
 
         stream.write_all(connect_request.as_bytes()).await?;
 
-        // Peek-based buffered HTTP response header reader to avoid byte-by-byte reads
-        let mut buf = vec![0u8; CONNECT_RESPONSE_INITIAL_BUF_SIZE];
-        let mut total_peeked = 0;
+        // Read the CONNECT response with normal reads instead of repeated `peek()`.
+        // `peek()` always starts at the current unread socket position; accumulating
+        // repeated peeks can duplicate partial headers and make a later read_exact()
+        // wait for bytes that do not exist.  Normal reads avoid that blocking mode;
+        // any bytes read past the response header are returned to the relay path as
+        // target-side leftover data so tunneled protocols with early server banners
+        // are not truncated.
+        let mut buf = BytesMut::with_capacity(CONNECT_RESPONSE_INITIAL_BUF_SIZE);
+        let mut temp = [0u8; 1024];
+        let mut start_pos = 0;
         let header_len = loop {
-            let n = stream.peek(&mut buf[total_peeked..]).await?;
+            if let Some(pos) = crate::util::find_header_separator(&buf, start_pos) {
+                if pos > CONNECT_RESPONSE_MAX_LEN {
+                    return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
+                }
+                break pos;
+            }
+            if buf.len() > CONNECT_RESPONSE_MAX_LEN {
+                return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
+            }
+
+            start_pos = buf.len();
+            let n = stream.read(&mut temp).await?;
             if n == 0 {
                 return Err(anyhow::anyhow!(
                     "Connection closed while reading CONNECT response"
                 ));
             }
-            total_peeked += n;
-            if let Some(pos) = crate::util::find_header_separator(&buf[..total_peeked], 0) {
-                break pos;
-            }
-            if total_peeked >= buf.len() {
-                if buf.len() >= CONNECT_RESPONSE_MAX_LEN {
-                    return Err(anyhow::anyhow!("HTTP CONNECT response headers too long"));
-                }
-                buf.resize(buf.len() * 2, 0u8);
-            }
+            buf.put_slice(&temp[..n]);
         };
 
-        // Read exactly the header bytes from the socket
-        let mut response = vec![0u8; header_len];
-        stream.read_exact(&mut response).await?;
+        let response = buf.split_to(header_len).freeze();
+        let target_leftover = buf.freeze();
 
         let response_str = String::from_utf8_lossy(&response);
         let status_line = response_str.lines().next().unwrap_or("");
@@ -332,7 +346,7 @@ Host: {formatted_host}:{port}\r\n\
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         if status_code == 200 {
-            Ok(())
+            Ok(target_leftover)
         } else {
             Err(anyhow::anyhow!(
                 "HTTP CONNECT failed (status {}): {}",
@@ -365,5 +379,73 @@ mod tests {
         // Invalid URLs
         assert!(ProxyConfig::from_url("socks5://127.0.0.1").is_err()); // missing port
         assert!(ProxyConfig::from_url("ftp://127.0.0.1:21").is_err()); // unsupported scheme
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_preserves_leftover_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if crate::util::find_header_separator(&request, 0).is_some() {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nBANNER")
+                .await
+                .unwrap();
+        });
+
+        let config = ProxyConfig::from_url(&format!("http://{}", addr)).unwrap();
+        let client = ProxyClient::new(config);
+        let (_stream, leftover) = client.connect("example.com", 443, true).await.unwrap();
+        assert_eq!(&leftover[..], b"BANNER");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_split_response_does_not_block() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if crate::util::find_header_separator(&request, 0).is_some() {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            socket.write_all(b"\r\n").await.unwrap();
+        });
+
+        let config = ProxyConfig::from_url(&format!("http://{}", addr)).unwrap();
+        let client = ProxyClient::new(config);
+        let (_stream, leftover) = timeout(
+            Duration::from_secs(1),
+            client.connect("example.com", 443, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(leftover.is_empty());
+        server_task.await.unwrap();
     }
 }

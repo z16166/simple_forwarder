@@ -192,7 +192,7 @@ impl ConnectionTracker {
         // read lock so concurrent readers (and writers via `modify`/`register`)
         // are not blocked (Issue 17).
         let count = self.snapshot_count.fetch_add(1, Ordering::Relaxed);
-        if count % 5 == 0 {
+        if count.is_multiple_of(5) {
             let mut state = self.state.write();
             state
                 .connections

@@ -142,7 +142,7 @@ impl TrayManager {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
-            .with_tooltip(&format!("{}\nMemory: Calculating...", APP_NAME))
+            .with_tooltip(format!("{}\nMemory: Calculating...", APP_NAME))
             .with_icon(icon_inactive.clone())
             .build()?;
 

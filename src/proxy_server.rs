@@ -130,6 +130,7 @@ pub struct HandshakeResult {
     pub is_direct: bool,
     pub protocol: Protocol,
     pub leftover: Bytes,
+    pub target_leftover: Bytes,
 }
 
 async fn handle_connection(
@@ -219,6 +220,7 @@ async fn handle_connection(
                     conn_id,
                     tracker,
                     leftover: hr.leftover,
+                    target_leftover: hr.target_leftover,
                     bytes_sent: bytes_sent_counter,
                     bytes_received: bytes_received_counter,
                 },
@@ -345,7 +347,7 @@ async fn handle_socks4(
         port
     );
 
-    let (target_stream, proxy_desc, is_direct) =
+    let (target_stream, proxy_desc, is_direct, target_leftover) =
         match connect_to_target(&host, port, is_socks4a, ip, rules, &mut stream, false).await {
             Ok(res) => res,
             Err(e) => {
@@ -370,6 +372,7 @@ async fn handle_socks4(
         is_direct,
         protocol: proto,
         leftover,
+        target_leftover,
     })
 }
 
@@ -468,7 +471,7 @@ async fn handle_socks5(
 
     log::debug!("SOCKS5 request from {}: {}:{}", peer_addr, host, port);
 
-    let (target_stream, proxy_desc, is_direct) =
+    let (target_stream, proxy_desc, is_direct, target_leftover) =
         connect_to_target(&host, port, resolve_hostname, ip, rules, &mut stream, true).await?;
 
     send_success_reply(&mut stream).await?;
@@ -487,6 +490,7 @@ async fn handle_socks5(
         is_direct,
         protocol: proto,
         leftover: Bytes::new(),
+        target_leftover,
     })
 }
 
@@ -517,9 +521,44 @@ async fn read_http_headers(stream: &mut TcpStream, first_byte: u8) -> Result<(Ve
     }
 }
 
+fn trim_ascii_bytes(mut s: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = s.split_first() {
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((last, rest)) = s.split_last() {
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+fn split_header_line(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let name = trim_ascii_bytes(&line[..colon]);
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, trim_ascii_bytes(&line[colon + 1..])))
+}
+
+fn iter_header_lines(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
+    headers.split(|&b| b == b'\n').filter_map(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() { None } else { Some(line) }
+    })
+}
+
 fn filter_hop_by_hop_headers(headers: &[u8]) -> Vec<u8> {
-    // Hop-by-hop headers to strip (lowercase). Kept as byte slices for
-    // direct ASCII case-insensitive comparison without String allocation (Issue 21).
+    // Hop-by-hop headers to strip (lowercase).  `Connection` can also name
+    // additional per-connection headers (for example `Connection: X-Foo`), so
+    // those tokens are collected in a first pass and stripped in the second.
     const HOP_BY_HOP: [&[u8]; 9] = [
         b"connection",
         b"keep-alive",
@@ -532,38 +571,33 @@ fn filter_hop_by_hop_headers(headers: &[u8]) -> Vec<u8> {
         b"upgrade",
     ];
 
-    let mut filtered = Vec::with_capacity(headers.len());
-    let mut pos = 0;
-    while pos < headers.len() {
-        // Find end of line (\r\n or \n).
-        let line_end = headers[pos..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|i| pos + i)
-            .unwrap_or(headers.len());
-        let line = &headers[pos..line_end];
-        // Advance past the newline character(s).
-        pos = line_end + 1;
-
-        // Strip trailing \r — line_end points at \n, so \r\n lines still
-        // carry the \r in the slice. Without this we'd emit \r\r\n.
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-
-        // Skip empty lines (end-of-headers marker is handled by caller).
-        if line.is_empty() {
+    let mut connection_tokens = std::collections::HashSet::<Vec<u8>>::new();
+    for line in iter_header_lines(headers) {
+        let Some((name, value)) = split_header_line(line) else {
             continue;
-        }
-
-        // Check if this line starts with a hop-by-hop header name followed by ':'.
-        let is_hop = HOP_BY_HOP.iter().any(|&name| {
-            if line.len() > name.len() && line[name.len()] == b':' {
-                line[..name.len()].eq_ignore_ascii_case(name)
-            } else {
-                false
+        };
+        if name.eq_ignore_ascii_case(b"connection") {
+            for token in value.split(|&b| b == b',') {
+                let token = trim_ascii_bytes(token);
+                if !token.is_empty() {
+                    connection_tokens.insert(token.to_ascii_lowercase());
+                }
             }
-        });
+        }
+    }
 
-        if !is_hop {
+    let mut filtered = Vec::with_capacity(headers.len());
+    for line in iter_header_lines(headers) {
+        let Some((name, _value)) = split_header_line(line) else {
+            continue;
+        };
+
+        let is_fixed_hop = HOP_BY_HOP
+            .iter()
+            .any(|&hop_name| name.eq_ignore_ascii_case(hop_name));
+        let is_connection_token = connection_tokens.contains(&name.to_ascii_lowercase());
+
+        if !is_fixed_hop && !is_connection_token {
             filtered.extend_from_slice(line);
             filtered.extend_from_slice(b"\r\n");
         }
@@ -642,7 +676,7 @@ async fn handle_http(
         port
     );
 
-    let (mut target_stream, proxy_desc, is_direct) =
+    let (mut target_stream, proxy_desc, is_direct, target_leftover) =
         match connect_to_target(&host, port, true, None, rules, &mut stream, false).await {
             Ok(res) => res,
             Err(e) => {
@@ -710,6 +744,7 @@ async fn handle_http(
         is_direct,
         protocol: Protocol::Http,
         leftover,
+        target_leftover,
     })
 }
 
@@ -721,7 +756,7 @@ async fn connect_to_target(
     rules: &[(RuleMatcher, ProxyConfig)],
     client_stream: &mut TcpStream,
     is_socks: bool,
-) -> Result<(TcpStream, String, bool)> {
+) -> Result<(TcpStream, String, bool, Bytes)> {
     for (matcher, proxy_config) in rules {
         if matcher.matches(host, ip) {
             log::debug!(
@@ -732,7 +767,7 @@ async fn connect_to_target(
             let proxy_url = format!("{}://{}", proxy_config.proxy_type, proxy_config.addr);
             let client = ProxyClient::new(proxy_config.clone());
             match client.connect(host, port, resolve_hostname).await {
-                Ok(s) => return Ok((s, proxy_url, false)),
+                Ok((s, target_leftover)) => return Ok((s, proxy_url, false, target_leftover)),
                 Err(e) => {
                     log::error!("Failed to connect to proxy {}: {}", proxy_config.addr, e);
                     if is_socks {
@@ -748,7 +783,7 @@ async fn connect_to_target(
     match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
         Ok(Ok(s)) => {
             let _ = s.set_nodelay(true);
-            Ok((s, "direct".to_string(), true))
+            Ok((s, "direct".to_string(), true, Bytes::new()))
         }
         Ok(Err(e)) => {
             log::error!("Failed to connect directly to {}:{}: {}", host, port, e);
@@ -782,6 +817,7 @@ struct RelayContext {
     conn_id: u64,
     tracker: Arc<ConnectionTracker>,
     leftover: Bytes,
+    target_leftover: Bytes,
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     bytes_received: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -840,6 +876,29 @@ async fn relay_data(stream: TcpStream, target_stream: TcpStream, ctx: RelayConte
     };
 
     let target_to_client = async {
+        if !ctx.target_leftover.is_empty() {
+            timeout(WRITE_TIMEOUT, client_writer.write_all(&ctx.target_leftover))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Client target-leftover write timeout ({}s)",
+                        WRITE_TIMEOUT.as_secs()
+                    )
+                })??;
+            if ctx.is_direct {
+                ctx.stats
+                    .direct_rx
+                    .fetch_add(ctx.target_leftover.len() as u64, Ordering::Relaxed);
+            } else {
+                ctx.stats
+                    .upstream_rx
+                    .fetch_add(ctx.target_leftover.len() as u64, Ordering::Relaxed);
+            }
+            ctx.bytes_received
+                .fetch_add(ctx.target_leftover.len() as u64, Ordering::Relaxed);
+            ctx.stats.traffic_active.store(true, Ordering::Relaxed);
+        }
+
         let mut buf = [0u8; RELAY_BUF_SIZE];
         loop {
             match timeout(IDLE_TIMEOUT, target_reader.read(&mut buf)).await {
@@ -984,13 +1043,18 @@ mod tests {
 
     #[test]
     fn test_filter_hop_by_hop_headers() {
-        // Normal \r\n headers — should preserve \r\n exactly (no double \r).
+        // Normal \r\n headers should preserve \r\n exactly (no double \r).
         let input = b"Host: example.com\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
         let out = filter_hop_by_hop_headers(input);
         assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
 
-        // \n-only headers — should output \r\n (normalised).
+        // \n-only headers should output \r\n (normalised).
         let input = b"Host: example.com\nConnection: keep-alive\nContent-Length: 0\n\n";
+        let out = filter_hop_by_hop_headers(input);
+        assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
+
+        // Headers named by Connection are hop-by-hop too and must not be forwarded.
+        let input = b"Host: example.com\r\nConnection: keep-alive, X-Foo, x-bar\r\nX-Foo: secret\r\nX-Bar: secret2\r\nContent-Length: 0\r\n\r\n";
         let out = filter_hop_by_hop_headers(input);
         assert_eq!(out, b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
     }
