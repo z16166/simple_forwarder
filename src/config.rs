@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
@@ -69,16 +70,68 @@ pub struct Rule {
     pub forward_to: String,
 }
 
+/// YAML parse failure with the source location reported by libyaml.
+#[derive(Debug)]
+pub(crate) struct YamlParseError {
+    pub path: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub message: String,
+}
+
+impl YamlParseError {
+    fn from_serde(path: &Path, err: serde_yaml::Error) -> Self {
+        let loc = err.location();
+        Self {
+            path: path.display().to_string(),
+            line: loc.as_ref().map(|l| l.line()),
+            column: loc.as_ref().map(|l| l.column()),
+            message: err.to_string(),
+        }
+    }
+
+    /// User-facing text for the config-error dialog.
+    pub(crate) fn dialog_text(&self) -> String {
+        match (self.line, self.column) {
+            (Some(line), Some(column)) => format!(
+                "A syntax error was found in:\n\n{}\n\nLine: {}\nColumn: {}\n\n{}",
+                self.path, line, column, self.message
+            ),
+            _ => format!("Failed to parse:\n\n{}\n\n{}", self.path, self.message),
+        }
+    }
+}
+
+impl fmt::Display for YamlParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.line, self.column) {
+            (Some(line), Some(column)) => write!(
+                f,
+                "Failed to parse {}: syntax error at line {}, column {}: {}",
+                self.path, line, column, self.message
+            ),
+            _ => write!(f, "Failed to parse {}: {}", self.path, self.message),
+        }
+    }
+}
+
+impl std::error::Error for YamlParseError {}
+
 impl Config {
+    pub(crate) fn parse_yaml(
+        content: &str,
+        path: &Path,
+    ) -> std::result::Result<Self, YamlParseError> {
+        serde_yaml::from_str(content).map_err(|err| YamlParseError::from_serde(path, err))
+    }
+
     pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = tokio::fs::read_to_string(path.as_ref())
+        let path = path.as_ref();
+        let content = tokio::fs::read_to_string(path)
             .await
-            .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let config: Config =
-            serde_yaml::from_str(&content).with_context(|| "Failed to parse config file")?;
-
-        Ok(config)
+        Self::parse_yaml(&content, path).map_err(Into::into)
     }
 
     pub fn get_listen_addr(&self) -> Result<SocketAddr> {
@@ -147,5 +200,45 @@ rules: []
         assert_eq!(config.log.level, "warn"); // default
         assert_eq!(config.listen.addr, "127.0.0.1"); // default
         assert_eq!(config.listen.port, 8080);
+    }
+
+    #[test]
+    fn test_yaml_syntax_error_reports_line_and_column() {
+        // `@` cannot start a YAML token; libyaml reports this at line 2, column 1.
+        let yaml = "log:\n@invalid\n";
+        let err = Config::parse_yaml(yaml, Path::new("config.yaml")).unwrap_err();
+        assert_eq!(err.line, Some(2));
+        assert_eq!(err.column, Some(1));
+        assert!(err.path.contains("config.yaml"));
+    }
+
+    #[test]
+    fn test_yaml_syntax_error_dialog_text_includes_location() {
+        let err = YamlParseError {
+            path: "D:\\app\\config.yaml".to_string(),
+            line: Some(12),
+            column: Some(5),
+            message: "found unexpected end of stream".to_string(),
+        };
+        let text = err.dialog_text();
+        assert!(text.contains("D:\\app\\config.yaml"));
+        assert!(text.contains("Line: 12"));
+        assert!(text.contains("Column: 5"));
+        assert!(text.contains("found unexpected end of stream"));
+    }
+
+    #[test]
+    fn test_yaml_error_without_location_omits_line_column() {
+        let err = YamlParseError {
+            path: "config.yaml".to_string(),
+            line: None,
+            column: None,
+            message: "EOF while parsing a value".to_string(),
+        };
+        let text = err.dialog_text();
+        assert!(text.contains("config.yaml"));
+        assert!(!text.contains("Line:"));
+        assert!(!text.contains("Column:"));
+        assert!(text.contains("EOF while parsing a value"));
     }
 }

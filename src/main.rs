@@ -118,9 +118,13 @@ fn main() {
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
                 use windows::core::HSTRING;
+                let text = match e.downcast_ref::<config::YamlParseError>() {
+                    Some(yaml_err) => yaml_err.dialog_text(),
+                    None => format!("{} failed to start:\n\n{}", tray::APP_NAME, e),
+                };
                 let _ = MessageBoxW(
                     None,
-                    &HSTRING::from(format!("{} failed to start:\n\n{}", tray::APP_NAME, e)),
+                    &HSTRING::from(text),
                     &HSTRING::from(&format!("{} - Startup Error", tray::APP_NAME)),
                     MB_OK | MB_ICONERROR,
                 );
@@ -247,7 +251,12 @@ async fn run_app_init() -> Result<(AppGuard, tray::TrayManager, etw_resolver::Ex
                     }
                     Err(e) => log::error!("Failed to parse new rules: {}", e),
                 },
-                Ok(Err(e)) => log::error!("Failed to reload config: {}", e),
+                Ok(Err(e)) => {
+                    log::error!("Failed to reload config: {}", e);
+                    if let Some(yaml_err) = e.downcast_ref::<config::YamlParseError>() {
+                        tray::show_config_parse_error(yaml_err);
+                    }
+                }
                 Err(_) => {
                     log::error!("Config reload timed out (file may be locked or on network share)")
                 }
