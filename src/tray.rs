@@ -1,3 +1,4 @@
+use crate::config::YamlParseError;
 use crate::connection_tracker::ConnectionTracker;
 use crate::stats::TrafficStats;
 use crate::traffic_window;
@@ -24,6 +25,43 @@ const REGISTRY_BUFFER_SIZE: usize = 1024;
 // consider using the `fluent` or `rust-i18n` crate and moving display strings
 // to a localization table (e.g. `locales/en.toml`, `locales/zh.toml`).
 pub(crate) const APP_NAME: &str = "Simple Forwarder";
+
+/// Prevents stacking multiple config-error dialogs while the user is editing.
+static CONFIG_ERROR_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Show a YAML syntax-error dialog on a worker thread so the Win32 message
+/// loop (tray clicks, icon updates, quit) keeps pumping.
+pub(crate) fn show_config_parse_error(err: &YamlParseError) {
+    log::error!("{}", err);
+
+    #[cfg(windows)]
+    {
+        if CONFIG_ERROR_DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let text = err.dialog_text();
+        std::thread::spawn(move || {
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+                };
+                use windows::core::HSTRING;
+                let _ = MessageBoxW(
+                    None,
+                    &HSTRING::from(&text),
+                    &HSTRING::from(&format!("{} - Config Error", APP_NAME)),
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+                );
+            }
+            CONFIG_ERROR_DIALOG_OPEN.store(false, Ordering::SeqCst);
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        eprintln!("{}", err.dialog_text());
+    }
+}
 
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::GetLongPathNameW;
